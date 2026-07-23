@@ -389,3 +389,6 @@
 [REQUEST] GET /api/progress?id=search_1784733039388_435
 [REQUEST] GET /api/progress?id=search_1784733039388_435
 [REQUEST] GET /api/progress?id=search_1784733039388_435
+[REQUEST] GET /
+[REQUEST] GET /style.css
+[REQUEST] GET /app.js
