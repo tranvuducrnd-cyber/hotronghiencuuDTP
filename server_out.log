@@ -9,3 +9,6 @@
 [REQUEST] GET /
 [REQUEST] GET /style.css
 [REQUEST] GET /app.js
+[REQUEST] GET /
+[REQUEST] GET /style.css
+[REQUEST] GET /app.js
