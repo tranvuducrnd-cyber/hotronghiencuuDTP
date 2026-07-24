@@ -817,6 +817,8 @@ async function startSearch() {
     clinicalData: null,
   });
   clearProtocolItems();
+  // Xoá badge double-check của lượt trước (không để dính sang hoạt chất mới).
+  document.querySelectorAll('.dc-result').forEach((el) => { el.innerHTML = ''; });
 
   // Reset UI và ẩn các card kết quả từ lượt tìm kiếm trước
   hide('empty-state');
@@ -2506,6 +2508,67 @@ function renderClinicalError(msg) {
   setInner('sec-clinical', errorBox(msg));
 }
 
+// ── Double-check: AI thứ 2 đối chiếu nguồn thật cho từng tab ───────────────────
+const DC_SECTION_TAB = {
+  drug: 'tab-drug', clinical: 'tab-clinical', stability: 'tab-stability',
+  sra: 'tab-sra', patents: 'tab-patents', pharma: 'tab-pharma', compat: 'tab-compatibility',
+};
+
+async function doubleCheck(section) {
+  const panel = document.getElementById(DC_SECTION_TAB[section]);
+  const resultEl = document.getElementById('dc-result-' + section);
+  const btn = panel ? panel.querySelector('.dc-btn') : null;
+  if (!panel || !resultEl) return;
+
+  // Lấy text đang hiển thị của tab làm "các thông tin cần kiểm" — bỏ thanh dc-toolbar + mọi nút.
+  const clone = panel.cloneNode(true);
+  clone.querySelectorAll('.dc-toolbar, button').forEach((el) => el.remove());
+  const claimsText = (clone.innerText || '').replace(/\n{3,}/g, '\n\n').trim();
+  if (claimsText.length < 40) {
+    resultEl.innerHTML = `<span class="dc-badge dc-unknown">Chưa có dữ liệu để kiểm tra ở mục này — hãy tra cứu trước.</span>`;
+    return;
+  }
+
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang đối chiếu nguồn...'; }
+  resultEl.innerHTML = `<span class="dc-badge dc-unknown">⏳ AI thứ 2 đang tra nguồn thật để kiểm tra chéo...</span>`;
+  try {
+    const data = await api('/api/double-check', {
+      section, drugName: state.drugName, dosageForm: state.dosageForm,
+      claimsText, openaiKey: state.openaiKey,
+    });
+    resultEl.innerHTML = renderDoubleCheckBadge(data);
+  } catch (e) {
+    resultEl.innerHTML = `<span class="dc-badge dc-warn">Lỗi kiểm tra: ${escHtml(e.message)}</span>`;
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = originalLabel || '🔍 Double-check mục này'; }
+  }
+}
+
+function renderDoubleCheckBadge(data) {
+  const sourcesHtml = (data.sources && data.sources.length)
+    ? `<div class="dc-sources"><div class="dc-sources-label">📚 Nguồn đã đối chiếu (${data.sources.length}):</div>
+       ${data.sources.map((s) => `<a href="${escHtml(s.url)}" target="_blank" rel="noopener">${escHtml(s.title || s.url)}</a>`).join('')}</div>`
+    : '';
+  const summaryHtml = data.summary ? `<div class="dc-summary">${escHtml(data.summary)}</div>` : '';
+
+  if (data.verdict === 'verified') {
+    return `<div class="dc-out"><span class="dc-badge dc-ok">✓ Đã double-check — khớp nguồn thật</span>${summaryHtml}${sourcesHtml}</div>`;
+  }
+  if (data.verdict === 'issues') {
+    const issues = (data.issues || []).map((it) => `
+      <div class="dc-issue">
+        <div class="dc-issue-claim">⚠️ ${escHtml(it.claim || '')}</div>
+        ${it.problem ? `<div><b>Vấn đề:</b> ${escHtml(it.problem)}</div>` : ''}
+        ${it.correction ? `<div><b>Đúng theo nguồn:</b> ${escHtml(it.correction)}</div>` : ''}
+        ${it.sourceUrl ? `<div><a href="${escHtml(it.sourceUrl)}" target="_blank" rel="noopener">🔗 Nguồn</a></div>` : ''}
+      </div>`).join('');
+    return `<div class="dc-out"><span class="dc-badge dc-warn">⚠️ Phát hiện ${(data.issues || []).length} điểm cần xem lại</span>${summaryHtml}${issues}${sourcesHtml}</div>`;
+  }
+  // unknown
+  return `<div class="dc-out"><span class="dc-badge dc-unknown">◐ Chưa đủ nguồn để xác minh chắc chắn</span>${summaryHtml}${sourcesHtml}</div>`;
+}
+
 // ── History Tab ───────────────────────────────────────────────────────────────
 
 function formatHistoryDate(iso) {
@@ -2515,16 +2578,22 @@ function formatHistoryDate(iso) {
 }
 
 async function loadHistoryTab() {
+  const _t0 = performance.now();
   await appReady;
+  const _tReady = performance.now();
   if (!supabase || !currentProfile) return;
   setInner('sec-history-list', '<div class="skeleton" style="height:120px;border-radius:12px;"></div>');
   try {
     // Chỉ tải các cột NHẸ cho danh sách — KHÔNG tải cột "data" (chứa toàn bộ dữ liệu nghiên cứu của
     // mỗi lượt, rất nặng). "data" chỉ được tải khi bấm mở 1 mục cụ thể (xem loadHistoryItem).
+    // Giới hạn 200 dòng mới nhất để tránh tải quá nhiều nếu lịch sử rất dài.
     const { data, error } = await supabase
       .from('search_history')
       .select('id, drug_name, dosage_form, created_at')
-      .order('created_at', { ascending: false });
+      .order('created_at', { ascending: false })
+      .limit(200);
+    const _tQuery = performance.now();
+    console.log(`[History] chờ appReady: ${(_tReady - _t0).toFixed(0)}ms | truy vấn: ${(_tQuery - _tReady).toFixed(0)}ms | số dòng: ${data ? data.length : 0}`);
     if (error) throw error;
 
     if (!data || data.length === 0) {

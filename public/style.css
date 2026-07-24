@@ -1167,3 +1167,58 @@ select.input-field:invalid { color: var(--text-3); }
 .pi-pick input { accent-color: #2563eb; cursor: pointer; margin: 0; width: 13px; height: 13px; }
 .pi-check:checked ~ span { color: #16a34a; }
 .pi-pick:has(.pi-check:checked) { background: rgba(22,163,74,0.12); border-color: rgba(22,163,74,0.35); color: #16a34a; }
+
+/* ── Double-check: nút + badge kiểm tra chéo AI thứ 2 ─────────────────────── */
+.dc-toolbar {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.9rem;
+}
+.dc-btn {
+  border: 1px solid rgba(37,99,235,0.35);
+  background: rgba(37,99,235,0.08);
+  color: #2563eb;
+  border-radius: 8px;
+  padding: 0.45rem 0.9rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.dc-btn:hover:not(:disabled) { background: rgba(37,99,235,0.16); }
+.dc-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.dc-result { display: block; flex: 1 1 260px; min-width: 240px; }
+
+.dc-badge {
+  display: inline-block;
+  font-size: 0.76rem;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 100px;
+  line-height: 1.4;
+}
+.dc-ok      { background: rgba(22,163,74,0.12);  color: #15803d; border: 1px solid rgba(22,163,74,0.3); }
+.dc-warn    { background: rgba(245,158,11,0.14); color: #b45309; border: 1px solid rgba(245,158,11,0.35); }
+.dc-unknown { background: rgba(100,116,139,0.12); color: #475569; border: 1px solid rgba(100,116,139,0.3); }
+
+.dc-out { margin-top: 2px; }
+.dc-summary { font-size: 0.8rem; color: var(--text-2); margin-top: 6px; line-height: 1.6; }
+.dc-issue {
+  margin-top: 8px;
+  padding: 8px 10px;
+  background: rgba(245,158,11,0.06);
+  border: 1px solid rgba(245,158,11,0.25);
+  border-left: 3px solid #f59e0b;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--text-2);
+}
+.dc-issue-claim { font-weight: 600; color: #b45309; margin-bottom: 3px; }
+.dc-issue a, .dc-sources a { color: #2563eb; text-decoration: none; word-break: break-all; }
+.dc-issue a:hover, .dc-sources a:hover { text-decoration: underline; }
+.dc-sources { margin-top: 8px; font-size: 0.76rem; display: flex; flex-direction: column; gap: 3px; }
+.dc-sources-label { color: var(--text-3); font-weight: 600; }

@@ -2508,6 +2508,75 @@ ${monographText || '(Không trích xuất được PDF — hãy TỰ TRA CỨU c
 // ── Route: Thông tin dược lý & bào chế (kiểu hồ sơ P2) ─────────────────────────
 // Dùng DeepSeek :online đọc tài liệu kê toa thật (SmPC/EMA, nhãn FDA, DrugBank, MIMS...) và trả về
 // 6 mục thông tin kèm trích dẫn nguồn. Mục Giải phóng thuốc & Thành phần tá dược bám theo dạng bào chế.
+// ── Route: Double-check — AI thứ 2 độc lập đối chiếu nguồn thật để kiểm tra chéo ──────────────
+// Nhận text đang hiển thị của 1 tab; AI (:online) tự tra web/tài liệu THẬT để xác minh từng khẳng
+// định. KHÔNG bịa; chỉ nêu vấn đề khi có căn cứ nguồn thật.
+const DC_SECTION_LABEL = {
+  clinical: 'Thông tin dược lý & bào chế', drug: 'Đặc điểm hoạt chất (cấu trúc, tính chất lý-hoá-sinh)',
+  stability: 'Độ ổn định / phân hủy cưỡng bức', sra: 'Công thức tham khảo & quy trình bào chế',
+  patents: 'Patent thuốc gốc', pharma: 'Tiêu chuẩn chất lượng theo dược điển',
+  compat: 'Tương tác hoạt chất – tá dược',
+};
+app.post('/api/double-check', requireApprovedUser, async (req, res) => {
+  const { section, drugName, dosageForm, claimsText } = req.body;
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
+  if (!claimsText || claimsText.trim().length < 30) {
+    return res.status(400).json({ error: 'Chưa có đủ dữ liệu để kiểm tra ở mục này.' });
+  }
+  const sectionLabel = DC_SECTION_LABEL[section] || section || 'thông tin';
+  try {
+    const text = await callOpenAI(openaiKey, [
+      {
+        role: 'system',
+        content: `Bạn là CHUYÊN GIA KIỂM ĐỊNH ĐỘC LẬP về dược, có khả năng tìm kiếm web thời gian thực. Nhiệm vụ: đối chiếu CÁC THÔNG TIN do một hệ thống khác tạo ra với NGUỒN THẬT (dược điển, SmPC/nhãn FDA, DrugBank, PubChem, Handbook of Pharmaceutical Excipients, bài báo khoa học...) để xác minh độ chính xác.
+NGUYÊN TẮC:
+- TỰ TRA WEB/tài liệu thật để kiểm chứng TỪNG khẳng định quan trọng (số liệu, cơ chế, chỉ định, độ tan, pKa, tương kỵ, tiêu chuẩn...).
+- TUYỆT ĐỐI KHÔNG bịa. Chỉ kết luận "sai/nghi ngờ" khi có CĂN CỨ từ nguồn thật; "sourceUrl" phải là URL thật đã tra.
+- Nếu một khẳng định đúng/khớp nguồn → không đưa vào "issues".
+- Nếu KHÔNG tìm đủ nguồn để kết luận chắc chắn → dùng verdict "unknown" (KHÔNG gắn "verified", cũng KHÔNG báo sai oan).
+- Chỉ tập trung các khẳng định CÓ THỂ KIỂM CHỨNG; bỏ qua phần trình bày/nhãn giao diện.
+- Trả lời TIẾNG VIỆT. JSON hợp lệ, KHÔNG markdown bao ngoài.`,
+      },
+      {
+        role: 'user',
+        content: `Thuốc: "${drugName || '(không rõ)'}"${dosageForm ? `, dạng bào chế: ${dosageForm}` : ''}.
+Mục cần kiểm: ${sectionLabel}.
+
+CÁC THÔNG TIN CẦN KIỂM (do hệ thống tạo ra):
+"""
+${String(claimsText).slice(0, 12000)}
+"""
+
+Hãy đối chiếu nguồn thật và trả về JSON:
+{
+  "verdict": "verified" | "issues" | "unknown",
+  "summary": "1-2 câu tổng kết kết quả kiểm định",
+  "issues": [{"claim": "khẳng định gốc bị sai/nghi ngờ", "problem": "vấn đề là gì", "correction": "thông tin đúng theo nguồn", "sourceUrl": "URL nguồn thật"}],
+  "sources": [{"url": "URL thật đã tra", "title": "tên tài liệu"}]
+}
+- "verified": các khẳng định chính đều khớp nguồn thật (issues rỗng).
+- "issues": có ít nhất 1 điểm sai/lệch có căn cứ.
+- "unknown": không đủ nguồn để kết luận.`,
+      },
+    ], 'deepseek/deepseek-chat:online', 3, 8000);
+
+    const parsed = safeParseJSON(text);
+    // Chuẩn hoá tối thiểu để frontend luôn có cấu trúc ổn định.
+    const verdict = ['verified', 'issues', 'unknown'].includes(parsed.verdict) ? parsed.verdict
+      : (Array.isArray(parsed.issues) && parsed.issues.length ? 'issues' : 'unknown');
+    res.json({
+      verdict,
+      summary: parsed.summary || '',
+      issues: Array.isArray(parsed.issues) ? parsed.issues : [],
+      sources: Array.isArray(parsed.sources) ? parsed.sources : [],
+    });
+  } catch (err) {
+    console.error('[Double-check error]', err.message);
+    res.status(500).json({ error: 'Không kiểm tra được lúc này: ' + err.message });
+  }
+});
+
 // ── Route: Xuất Protocol nghiên cứu (.docx) từ các block đã chọn ──────────────
 app.post('/api/protocol/export', requireApprovedUser, async (req, res) => {
   try {
