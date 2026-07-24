@@ -3,3 +3,7 @@ node_modules/
 *.log
 .DS_Store
 .claude/
+
+# PDF nguồn của Handbook of Pharmaceutical Excipients (272MB — vượt giới hạn GitHub, không cần cho
+# bản deploy). Chỉ data/excipients.json (đã tiền xử lý, ~5MB) mới được commit và dùng lúc chạy.
+data/HoPE.pdf.pdf
