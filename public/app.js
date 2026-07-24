@@ -2519,9 +2519,11 @@ async function loadHistoryTab() {
   if (!supabase || !currentProfile) return;
   setInner('sec-history-list', '<div class="skeleton" style="height:120px;border-radius:12px;"></div>');
   try {
+    // Chỉ tải các cột NHẸ cho danh sách — KHÔNG tải cột "data" (chứa toàn bộ dữ liệu nghiên cứu của
+    // mỗi lượt, rất nặng). "data" chỉ được tải khi bấm mở 1 mục cụ thể (xem loadHistoryItem).
     const { data, error } = await supabase
       .from('search_history')
-      .select('id, drug_name, dosage_form, data, created_at')
+      .select('id, drug_name, dosage_form, created_at')
       .order('created_at', { ascending: false });
     if (error) throw error;
 
@@ -2535,9 +2537,7 @@ async function loadHistoryTab() {
       return;
     }
 
-    window.__historyCache = window.__historyCache || {};
     const rows = data.map((row, i) => {
-      window.__historyCache[row.id] = row;
       return `
         <tr>
           <td>${i + 1}</td>
@@ -2566,9 +2566,30 @@ async function loadHistoryTab() {
   }
 }
 
-function loadHistoryItem(id) {
-  const row = window.__historyCache && window.__historyCache[id];
-  if (!row) return;
+async function loadHistoryItem(id) {
+  if (!supabase) return;
+  // Tải dữ liệu ĐẦY ĐỦ của riêng mục này (cột "data" nặng) chỉ khi người dùng bấm mở.
+  hide('empty-state');
+  hide('results-section');
+  show('loading-section');
+  document.getElementById('loading-section')?.classList.add('active');
+  let row;
+  try {
+    const res = await supabase
+      .from('search_history')
+      .select('data, drug_name, dosage_form')
+      .eq('id', id).single();
+    if (res.error) throw res.error;
+    row = res.data;
+  } catch (e) {
+    hide('loading-section');
+    show('results-section');
+    alert('Không tải được lịch sử này: ' + (e.message || e));
+    return;
+  }
+  document.getElementById('loading-section')?.classList.remove('active');
+  hide('loading-section');
+
   const d = row.data || {};
   Object.assign(state, {
     drugName: row.drug_name,
