@@ -39,10 +39,6 @@
     </div>
 
     <nav class="sidebar-nav">
-      <button class="sidebar-nav-btn" id="sidebar-p2-btn" onclick="switchPage('page-p2', this)" title="Viết P2 - Đăng ký thuốc">
-        <span class="sidebar-nav-icon">📝</span>
-        <span class="sidebar-nav-label">Viết P2 - Đăng ký thuốc</span>
-      </button>
       <button class="sidebar-nav-btn active" id="sidebar-setup-btn" onclick="switchPage('page-setup', this)" title="Thiết lập báo cáo khả thi">
         <span class="sidebar-nav-icon">🧪</span>
         <span class="sidebar-nav-label">Thiết lập báo cáo khả thi</span>
@@ -68,15 +64,6 @@
       <button class="topbar-menu-btn" onclick="toggleSidebar()" title="Thu gọn/Mở rộng menu">☰</button>
     </div>
     <main class="main-content" id="main-content">
-
-      <!-- ══ Page: Viết P2 - Đăng ký thuốc ═══════════════════════════════ -->
-      <div id="page-p2" class="page-panel">
-        <div class="section-card" style="text-align:center; padding:4rem 2rem;">
-          <div style="font-size:3rem; margin-bottom:1rem;">🚧</div>
-          <div class="section-title" style="font-size:1.2rem; margin-bottom:0.5rem;">Sắp ra mắt</div>
-          <div class="text-3" style="max-width:480px; margin:0 auto;">Tính năng "Viết P2 - Đăng ký thuốc" đang được phát triển. Nội dung sẽ được cập nhật sớm.</div>
-        </div>
-      </div><!-- /page-p2 -->
 
       <!-- ══ Page: Thiết lập báo cáo khả thi ══════════════════════════════ -->
       <div id="page-setup" class="page-panel active">
@@ -124,6 +111,7 @@
                 <label class="search-section-check"><input type="checkbox" id="cb-patents" checked> 📄 Patent thuốc gốc</label>
                 <label class="search-section-check"><input type="checkbox" id="cb-pharma" checked> 📖 Dược điển</label>
                 <label class="search-section-check"><input type="checkbox" id="cb-compatibility" checked> 🤝 Tương tác tá dược</label>
+                <label class="search-section-check"><input type="checkbox" id="cb-clinical" checked> 📋 Thông tin dược lý & bào chế</label>
               </div>
             </div>
 
@@ -151,9 +139,28 @@
         <!-- Results -->
         <div id="results-section" style="display:none">
 
+          <!-- Thanh tạo Protocol nghiên cứu (Word) -->
+          <div class="protocol-bar">
+            <div class="protocol-bar-info">
+              <span class="protocol-bar-icon">📝</span>
+              <div>
+                <div class="protocol-bar-title">Tạo Protocol nghiên cứu</div>
+                <div class="protocol-bar-sub">Tick ô "Đưa vào Protocol" ở các thông tin cần dùng, rồi xuất file Word (.docx)</div>
+              </div>
+            </div>
+            <div class="protocol-bar-actions">
+              <button type="button" class="protocol-mini-btn" onclick="protocolSelectAll(true)">Chọn tất cả</button>
+              <button type="button" class="protocol-mini-btn" onclick="protocolSelectAll(false)">Bỏ chọn</button>
+              <button type="button" id="btn-protocol" class="protocol-main-btn" onclick="openProtocolModal()" disabled>📝 Tạo Protocol Word (0 mục)</button>
+            </div>
+          </div>
+
           <!-- Tabs -->
           <div class="tabs-wrap" role="tablist">
-            <button class="tab-btn active" role="tab" onclick="switchTab('tab-drug', this)">
+            <button class="tab-btn active" role="tab" onclick="switchTab('tab-clinical', this)">
+              📋 Thông tin dược lý & bào chế
+            </button>
+            <button class="tab-btn" role="tab" onclick="switchTab('tab-drug', this)">
               🧬 Đặc điểm hoạt chất
             </button>
             <button class="tab-btn" role="tab" onclick="switchTab('tab-stability', this)">
@@ -174,7 +181,7 @@
           </div>
 
           <!-- ══ Tab 1: Drug Properties ═══════════════════════════════════ -->
-          <div id="tab-drug" class="tab-panel active">
+          <div id="tab-drug" class="tab-panel">
 
             <!-- 1.1 Chemical Structure -->
             <div class="section-card">
@@ -403,6 +410,22 @@
               </div>
             </div>
           </div><!-- /tab-compatibility -->
+
+          <!-- ══ Tab 7: Clinical / Pharmacology info ═══════════════════════════ -->
+          <div id="tab-clinical" class="tab-panel active">
+            <div class="section-card">
+              <div class="section-header">
+                <div class="section-icon icon-green">📋</div>
+                <div class="section-title">Thông tin dược lý & bào chế</div>
+              </div>
+              <div class="section-body" id="sec-clinical">
+                <div class="empty-state" style="padding:2rem">
+                  <div class="empty-state-icon">📋</div>
+                  <div class="empty-state-sub">Nhập tên hoạt chất và dạng bào chế rồi bấm Tra cứu để xem chỉ định, liều dùng, dược động học/dược lực học, giải phóng thuốc và thành phần tá dược</div>
+                </div>
+              </div>
+            </div>
+          </div><!-- /tab-clinical -->
 
         </div><!-- /results-section -->
       </div><!-- /page-setup -->
