@@ -48,7 +48,7 @@
 /* ── Reset & Base ──────────────────────────────────────────────────────── */
 *,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-html { font-size: 13.5px; scroll-behavior: smooth; }
+html { font-size: clamp(12px, 0.4vw + 9px, 13.5px); scroll-behavior: smooth; }
 
 body {
   font-family: 'Inter', system-ui, sans-serif;
@@ -451,7 +451,8 @@ select.input-field:invalid { color: var(--text-3); }
 /* ── Tabs ──────────────────────────────────────────────────────────────── */
 .tabs-wrap {
   display: flex;
-  gap: 1.75rem;
+  flex-wrap: wrap;
+  gap: 0.6rem 1.75rem;
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--card-border);
@@ -987,6 +988,21 @@ select.input-field:invalid { color: var(--text-3); }
 .divider { height: 1px; background: var(--card-border); margin: 1.2rem 0; }
 
 /* ── Responsive ────────────────────────────────────────────────────────── */
+/* Laptop cỡ vừa: thu gọn sidebar thành dải icon + co bố cục cho vừa màn hình */
+@media (max-width: 1024px) {
+  .sidebar { width: 68px; padding: 1rem 0.5rem; }
+  .app-main { margin-left: 68px; }
+  .logo-text, .sidebar-nav-label,
+  .user-badge-email, .user-badge-role, .user-badge-logout-btn span { display: none; }
+  .logo { justify-content: center; padding: 0.4rem 0 1.25rem; }
+  .sidebar-nav-btn { justify-content: center; padding: 0.7rem; }
+  .user-badge-logout-btn { padding: 0.5rem; }
+  .search-sections-grid { grid-template-columns: repeat(2, 1fr); }
+  .hero { padding: 2.25rem 1.25rem 1.5rem; }
+  .main-content { padding: 0 1.25rem 3rem; }
+  .tabs-wrap { gap: 0.6rem 1.1rem; }
+}
+
 @media (max-width: 768px) {
   .sidebar { width: 68px; padding: 1rem 0.5rem; }
   .app-main { margin-left: 68px; }
