@@ -451,14 +451,18 @@ select.input-field:invalid { color: var(--text-3); }
 /* ── Tabs ──────────────────────────────────────────────────────────────── */
 .tabs-wrap {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.6rem 1.75rem;
+  flex-wrap: nowrap;               /* luôn 1 dòng */
+  gap: clamp(8px, 1.1vw, 28px);    /* khoảng cách tự co theo màn hình */
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--card-border);
   padding: 0;
   margin-bottom: 1.5rem;
+  overflow-x: auto;                /* dự phòng: màn cực nhỏ thì cuộn ngang, không cắt cụt */
+  scrollbar-width: thin;
 }
+.tabs-wrap::-webkit-scrollbar { height: 4px; }
+.tabs-wrap::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 4px; }
 
 .tab-btn {
   flex: none;
@@ -468,17 +472,17 @@ select.input-field:invalid { color: var(--text-3); }
   border-bottom: 2px solid transparent;
   border-radius: 0;
   color: var(--text-2);
-  font-size: 0.8rem;
+  font-size: clamp(9px, 0.68vw + 4px, 10.8px);  /* cỡ chữ tab tự co để 7 tab vừa 1 dòng */
   font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.02em;
   font-family: inherit;
   cursor: pointer;
   transition: all 0.2s;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 7px;
+  gap: clamp(4px, 0.4vw, 7px);
   white-space: nowrap;
   margin-bottom: -1px;
 }
@@ -1000,7 +1004,6 @@ select.input-field:invalid { color: var(--text-3); }
   .search-sections-grid { grid-template-columns: repeat(2, 1fr); }
   .hero { padding: 2.25rem 1.25rem 1.5rem; }
   .main-content { padding: 0 1.25rem 3rem; }
-  .tabs-wrap { gap: 0.6rem 1.1rem; }
 }
 
 @media (max-width: 768px) {
@@ -1016,7 +1019,6 @@ select.input-field:invalid { color: var(--text-3); }
   .search-sections-grid { grid-template-columns: repeat(2, 1fr); }
   .api-keys-row { grid-template-columns: 1fr; }
   .structure-layout { grid-template-columns: 1fr; }
-  .tabs-wrap { flex-wrap: wrap; gap: 1rem; }
 }
 
 @media (max-width: 480px) {
