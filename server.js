@@ -5,9 +5,25 @@ const path    = require('path');
 const { PDFParse } = require('pdf-parse');
 const { createClient } = require('@supabase/supabase-js');
 const docx = require('docx');
+const helmet = require('helmet');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
+
+// Security headers (HSTS, chống clickjacking, nosniff, ẩn x-powered-by...).
+// Tắt CSP để không chặn script Supabase từ CDN & ảnh ngoài (CDK/ChEMBL/PubChem/patent).
+app.use(helmet({ contentSecurityPolicy: false }));
+
+// Che các trường nhạy cảm (key/token/password...) trước khi ghi log.
+function redactSecrets(body) {
+  if (!body || typeof body !== 'object') return body;
+  const SENSITIVE = /(key|token|password|secret|authorization)/i;
+  const clone = Array.isArray(body) ? [...body] : { ...body };
+  for (const k of Object.keys(clone)) {
+    if (SENSITIVE.test(k)) clone[k] = '***';
+  }
+  return clone;
+}
 
 // ── Supabase (service-role client, chỉ dùng trên server) ────────────────────
 const supabaseAdmin = (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY)
@@ -71,13 +87,27 @@ app.post('/api/admin/invite-user', requireApprovedUser, requireAdmin, async (req
 app.use(express.json({ limit: '10mb' }));
 app.use((req, res, next) => {
   if (req.method === 'POST') {
-    console.log(`[REQUEST] ${req.method} ${req.url} - body:`, JSON.stringify(req.body).substring(0, 300));
+    console.log(`[REQUEST] ${req.method} ${req.url} - body:`, JSON.stringify(redactSecrets(req.body)).substring(0, 300));
   } else {
     console.log(`[REQUEST] ${req.method} ${req.url}`);
   }
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Admin đặt lại mật khẩu cho 1 user (service_role). Đặt SAU express.json để đọc được req.body.
+app.post('/api/admin/set-password', requireApprovedUser, requireAdmin, async (req, res) => {
+  const { userId, newPassword } = req.body;
+  if (!userId || !newPassword) return res.status(400).json({ error: 'Thiếu userId hoặc mật khẩu mới' });
+  if (String(newPassword).length < 6) return res.status(400).json({ error: 'Mật khẩu tối thiểu 6 ký tự' });
+  try {
+    const { error } = await supabaseAdmin.auth.admin.updateUserById(userId, { password: newPassword });
+    if (error) return res.status(400).json({ error: error.message });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 app.get('/api/diag', async (req, res) => {
   const openaiKey = process.env.OPENAI_API_KEY || '';

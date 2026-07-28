@@ -661,6 +661,79 @@ async function handleLogout() {
   await supabase.auth.signOut();
 }
 
+// ── Đổi mật khẩu ──────────────────────────────────────────────────────────
+// Modal chung: nhập mật khẩu mới (+ nhập lại), tùy chọn có ô "mật khẩu hiện tại".
+// onSubmit({ current, next }) là async — nếu ném lỗi, modal giữ nguyên & hiện lỗi.
+function promptPassword({ title, withCurrent, onSubmit }) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(15,23,42,0.5);z-index:10000;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);';
+  const modal = document.createElement('div');
+  modal.style.cssText = 'background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:2rem;max-width:420px;width:90%;box-shadow:0 20px 60px rgba(15,23,42,0.25);';
+  const inputCss = 'width:100%;padding:0.6rem 0.8rem;border:1px solid #e2e8f0;border-radius:10px;font-size:0.9rem;margin-bottom:0.6rem;box-sizing:border-box;';
+  modal.innerHTML = `
+    <h3 style="color:#0f172a;margin:0 0 1.2rem 0;font-size:1.1rem;">${escHtml(title)}</h3>
+    ${withCurrent ? `<input id="pw-cur" type="password" placeholder="Mật khẩu hiện tại" style="${inputCss}">` : ''}
+    <input id="pw-new" type="password" placeholder="Mật khẩu mới (tối thiểu 6 ký tự)" style="${inputCss}">
+    <input id="pw-new2" type="password" placeholder="Nhập lại mật khẩu mới" style="${inputCss}">
+    <div id="pw-err" style="color:#dc2626;font-size:0.82rem;min-height:1.1em;margin-bottom:0.6rem;"></div>
+    <div style="display:flex;gap:0.6rem;justify-content:flex-end;">
+      <button id="pw-cancel" style="padding:0.6rem 1.2rem;border:1px solid #e2e8f0;border-radius:10px;background:transparent;color:#475569;cursor:pointer;font-size:0.85rem;">Hủy</button>
+      <button id="pw-ok" style="padding:0.6rem 1.4rem;border:none;border-radius:10px;background:var(--blue,#3b82f6);color:#fff;cursor:pointer;font-size:0.85rem;font-weight:600;">Xác nhận</button>
+    </div>`;
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
+  const close = () => overlay.remove();
+  const errEl = modal.querySelector('#pw-err');
+  modal.querySelector('#pw-cancel').addEventListener('click', close);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+  const okBtn = modal.querySelector('#pw-ok');
+  okBtn.addEventListener('click', async () => {
+    errEl.textContent = '';
+    const current = withCurrent ? modal.querySelector('#pw-cur').value : undefined;
+    const next = modal.querySelector('#pw-new').value;
+    const next2 = modal.querySelector('#pw-new2').value;
+    if (withCurrent && !current) { errEl.textContent = 'Nhập mật khẩu hiện tại.'; return; }
+    if (next.length < 6) { errEl.textContent = 'Mật khẩu mới tối thiểu 6 ký tự.'; return; }
+    if (next !== next2) { errEl.textContent = 'Hai mật khẩu mới không khớp.'; return; }
+    okBtn.disabled = true; okBtn.textContent = 'Đang lưu...';
+    try {
+      await onSubmit({ current, next });
+      close();
+    } catch (e) {
+      errEl.textContent = e.message || 'Có lỗi xảy ra.';
+      okBtn.disabled = false; okBtn.textContent = 'Xác nhận';
+    }
+  });
+}
+
+// User tự đổi mật khẩu của mình (xác minh mật khẩu hiện tại trước).
+async function changeMyPassword() {
+  if (!currentProfile) return;
+  promptPassword({
+    title: 'Đổi mật khẩu của bạn',
+    withCurrent: true,
+    onSubmit: async ({ current, next }) => {
+      const { error: signErr } = await supabase.auth.signInWithPassword({ email: currentProfile.email, password: current });
+      if (signErr) throw new Error('Mật khẩu hiện tại không đúng.');
+      const { error } = await supabase.auth.updateUser({ password: next });
+      if (error) throw new Error(error.message);
+      alert('Đổi mật khẩu thành công!');
+    },
+  });
+}
+
+// Admin đặt mật khẩu mới cho 1 user (qua server, service_role).
+async function adminSetPassword(userId, email) {
+  promptPassword({
+    title: 'Đặt mật khẩu mới cho: ' + email,
+    withCurrent: false,
+    onSubmit: async ({ next }) => {
+      await api('/api/admin/set-password', { userId, newPassword: next });
+      alert('Đã đặt mật khẩu mới cho ' + email + ':\n\n' + next + '\n\nHãy chuyển mật khẩu này cho user và nhắc họ đăng nhập rồi đổi lại.');
+    },
+  });
+}
+
 function updateUserBadge() {
   const badge = document.getElementById('user-badge');
   if (!badge) return;
@@ -668,6 +741,7 @@ function updateUserBadge() {
   setInner('user-badge', `
     <div class="user-badge-email" title="${escHtml(currentProfile.email)}">${escHtml(currentProfile.email)}</div>
     ${currentProfile.role === 'admin' ? '<div class="user-badge-role">Quản trị viên</div>' : ''}
+    <button class="user-badge-logout-btn" onclick="changeMyPassword()" style="margin-bottom:0.4rem;"><span>Đổi mật khẩu</span></button>
     <button class="user-badge-logout-btn" onclick="handleLogout()"><span>Đăng xuất</span></button>
   `);
   show('user-badge');
@@ -2722,6 +2796,7 @@ async function loadAdminTab() {
           <div style="display:flex;gap:0.5rem;">
             ${p.status !== 'approved' ? `<button onclick="setProfileStatus('${p.id}','approved')" style="padding:0.35rem 0.8rem;border:none;border-radius:8px;background:var(--green);color:#fff;cursor:pointer;font-size:0.78rem;font-weight:600;">Duyệt</button>` : ''}
             ${p.status !== 'rejected' ? `<button onclick="setProfileStatus('${p.id}','rejected')" style="padding:0.35rem 0.8rem;border:1px solid var(--red);border-radius:8px;background:transparent;color:var(--red);cursor:pointer;font-size:0.78rem;">Từ chối</button>` : ''}
+            <button onclick="adminSetPassword('${p.id}','${(p.email||'').replace(/'/g, "\\'")}')" style="padding:0.35rem 0.8rem;border:1px solid var(--blue,#3b82f6);border-radius:8px;background:transparent;color:var(--blue,#3b82f6);cursor:pointer;font-size:0.78rem;">Đổi MK</button>
           </div>
         </td>
       </tr>
