@@ -3,6 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Tự nâng tài nguyên http -> https, tránh cảnh báo Mixed Content trong Console -->
+  <meta http-equiv="Content-Security-Policy" content="upgrade-insecure-requests" />
+  <!-- Favicon (SVG data-URI, không cần file rời) -> hết lỗi favicon.ico 404 -->
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='88'>💊</text></svg>" />
   <title>Hỗ trợ nghiên cứu – Tra cứu nghiên cứu dược phẩm</title>
   <meta name="description" content="Nền tảng nghiên cứu dược phẩm tích hợp AI: phân tích hoạt chất, tra cứu công thức tham khảo đề xuất, tìm kiếm patent thuốc gốc." />
   <link rel="stylesheet" href="style.css" />

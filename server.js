@@ -11,8 +11,14 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 
 // Security headers (HSTS, chống clickjacking, nosniff, ẩn x-powered-by...).
-// Tắt CSP để không chặn script Supabase từ CDN & ảnh ngoài (CDK/ChEMBL/PubChem/patent).
-app.use(helmet({ contentSecurityPolicy: false }));
+// - Tắt CSP để không chặn script Supabase từ CDN & ảnh ngoài (CDK/ChEMBL/PubChem/patent).
+// - Tắt COEP + CORP để không chặn tải ảnh cross-origin (nếu bật sẽ gây
+//   ERR_BLOCKED_BY_RESPONSE.NotSameOrigin với ảnh cấu trúc/nguồn từ web ngoài).
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: false,
+}));
 
 // Che các trường nhạy cảm (key/token/password...) trước khi ghi log.
 function redactSecrets(body) {
