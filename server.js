@@ -1485,8 +1485,9 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
       });
 
       if (isMatch) {
-        // Đánh dấu nếu là đơn chất (tên trùng hoặc chứa chính xác tên hoạt chất)
-        const isMono = titleText.toLowerCase() === drugLower || titleText.toLowerCase().includes(drugLower);
+        // Đơn chất (mono) nếu tiêu đề KHÔNG phải công thức phối hợp nhiều hoạt chất.
+        // Vidal ghi phối hợp dạng "X + Y" hoặc "X и Y".
+        const isMono = !/[+]|\sи\s/i.test(titleText);
         filteredLinks.push({ title: titleText, url, isMono });
       }
     });
@@ -1530,7 +1531,8 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
             }
           });
           if (composition) {
-            productData.push({ title: link.title, url: link.url, text: composition });
+            const isMono = !/[+]|\sи\s/i.test(link.title || '');
+            productData.push({ title: link.title, url: link.url, text: composition, isMono });
           }
         } catch (e) {
           console.error('Error fetching vidal product:', link.url, e.message);
@@ -1543,6 +1545,8 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     // Không còn giới hạn số sản phẩm -> chia nhỏ thành từng lô (batch) để gọi AI song song,
     // tránh 1 lệnh gọi duy nhất phải sinh ra JSON quá dài (dễ bị cắt cụt/lỗi parse khi có nhiều sản phẩm).
     updateProgress(searchId, 'vidal', 80, 'Đang gửi dữ liệu tiếng Nga tới OpenAI để dịch...');
+    // Ưu tiên công thức ĐƠN CHẤT: xếp lên trước công thức phối hợp (giữ đúng thứ tự khi chia lô AI).
+    productData.sort((a, b) => (b.isMono ? 1 : 0) - (a.isMono ? 1 : 0));
     const BATCH_SIZE = 8;
     const productBatches = [];
     for (let i = 0; i < productData.length; i += BATCH_SIZE) {

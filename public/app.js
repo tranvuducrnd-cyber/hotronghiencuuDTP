@@ -1956,7 +1956,12 @@ function renderSRATab() {
   const d = state.sraData;
   if (!d) return;
 
-  const products = d.products || [];
+  // Ưu tiên hiển thị công thức ĐƠN CHẤT (không phối hợp "+") lên trước công thức phối hợp.
+  const products = (d.products || []).slice().sort((a, b) => {
+    const aCombo = /\+/.test((a.activeIngredient || '') + '|' + (a.productName || '')) ? 1 : 0;
+    const bCombo = /\+/.test((b.activeIngredient || '') + '|' + (b.productName || '')) ? 1 : 0;
+    return aCombo - bCombo;
+  });
   setInner('sra-count', products.length + ' sản phẩm');
 
   if (d.rawContent && !products.length) {
