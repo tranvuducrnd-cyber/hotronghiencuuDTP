@@ -2067,6 +2067,35 @@ app.get('/api/compatibility/image', async (req, res) => {
   }
 });
 
+// Proxy ảnh ngoài tổng quát — tránh bị chặn CORP/hotlink (vd ResearchGate).
+// Ảnh <img> không gửi được Bearer token nên route để public, nhưng CHỈ trả về ảnh
+// và chặn địa chỉ nội bộ (chống SSRF). Host nào chặn cả server → trả 404 để onerror ẩn ảnh.
+app.get('/api/img-proxy', async (req, res) => {
+  const raw = req.query.url;
+  if (!raw) return res.status(400).send('Missing url');
+  let u;
+  try { u = new URL(raw); } catch { return res.status(400).send('Bad url'); }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return res.status(400).send('Bad protocol');
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || host === '::1' || host.endsWith('.local') ||
+      /^(127\.|0\.|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(host)) {
+    return res.status(400).send('Blocked host');
+  }
+  try {
+    const imgRes = await axios.get(u.href, {
+      responseType: 'arraybuffer', timeout: 15000, maxContentLength: 8 * 1024 * 1024,
+      headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'image/*,*/*' },
+    });
+    const ct = imgRes.headers['content-type'] || '';
+    if (!ct.startsWith('image/')) return res.status(415).send('Not an image');
+    res.set('Content-Type', ct);
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.send(Buffer.from(imgRes.data));
+  } catch (e) {
+    res.status(404).send('Image not found');
+  }
+});
+
 // Phương án DỰ PHÒNG khi PharmDE sập: dùng DeepSeek :online phân tích tương tác hoạt chất–tá dược
 // từ tài liệu thật (Handbook of Pharmaceutical Excipients, nghiên cứu compatibility/DSC/stress...),
 // trả về ĐÚNG shape mà frontend đang render + kèm nguồn trích dẫn. TUYỆT ĐỐI không bịa.

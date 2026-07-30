@@ -419,6 +419,15 @@ async function api(endpoint, body) {
   return data;
 }
 
+// Cho ảnh ngoài đi qua proxy server để tránh bị chặn CORP/hotlink (vd ResearchGate).
+// Bỏ qua data-URI và URL cùng origin (bắt đầu bằng '/').
+function imgProxy(url) {
+  if (!url || typeof url !== 'string') return url;
+  if (url.startsWith('data:') || url.startsWith('/')) return url;
+  if (/^https?:\/\//i.test(url)) return '/api/img-proxy?url=' + encodeURIComponent(url);
+  return url;
+}
+
 // ── Drug Name Suggestion Modal ────────────────────────────────────────────────
 
 function showConfirmModal(title, message, confirmLabel = 'Tiếp tục', cancelLabel = 'Hủy') {
@@ -1180,7 +1189,7 @@ function renderDrugTab() {
 
   if (pc) {
     const imgHtml = pc.imageUrl
-      ? `<img class="structure-img" src="${pc.imageUrl}" alt="Cấu trúc ${escHtml(state.drugName)}" onerror="this.style.display='none'" />`
+      ? `<img class="structure-img" src="${escHtml(imgProxy(pc.imageUrl))}" alt="Cấu trúc ${escHtml(state.drugName)}" onerror="this.style.display='none'" />`
       : '<p style="color:var(--text-3);font-size:.8rem">Không có ảnh</p>';
 
     structureHtml = `
@@ -1351,7 +1360,7 @@ function renderDrugTab() {
       const polyImages = (Array.isArray(poly.images) && poly.images.length) ? poly.images : (poly.imageUrl ? [poly.imageUrl] : []);
       if (polyImages.length) {
         physHtml += `<div class="mt-2" style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center;">
-          ${polyImages.map(src => `<img src="${escHtml(src)}" alt="Crystal morphology" style="max-width:calc(33% - 6px); max-height:180px; border-radius:6px; border:1px solid rgba(15,23,42,0.1); object-fit:contain; background:#f1f5f9; padding:4px;" onerror="this.style.display='none'">`).join('')}
+          ${polyImages.map(src => `<img src="${escHtml(imgProxy(src))}" alt="Crystal morphology" style="max-width:calc(33% - 6px); max-height:180px; border-radius:6px; border:1px solid rgba(15,23,42,0.1); object-fit:contain; background:#f1f5f9; padding:4px;" onerror="this.style.display='none'">`).join('')}
         </div>`;
       }
 
@@ -2435,7 +2444,7 @@ function renderCompatibilityTab() {
         <div style="width:100%">${pickBox('compat', 'compat.' + idx, item.title || ('Tương tác ' + (idx + 1)), cBlock)}</div>
         ${item.imageUrl ? `
           <div class="compatibility-img-wrap" style="width: 140px; flex-shrink: 0; background: #fff; border-radius: var(--r-md); padding: 8px; display: flex; align-items: center; justify-content: center; aspect-ratio: 1; overflow: hidden; box-shadow: 0 4px 12px rgba(0,0,0,0.15); transition: transform 0.2s ease;">
-            <img src="${escHtml(item.imageUrl)}" style="max-width: 100%; max-height: 100%; object-fit: contain;" />
+            <img src="${escHtml(imgProxy(item.imageUrl))}" style="max-width: 100%; max-height: 100%; object-fit: contain;" onerror="this.style.display='none'" />
           </div>
         ` : ''}
         <div style="flex-grow: 1;">
