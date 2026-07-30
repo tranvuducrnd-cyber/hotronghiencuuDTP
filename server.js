@@ -2096,6 +2096,41 @@ app.get('/api/img-proxy', async (req, res) => {
   }
 });
 
+// Trợ lý AI nghiên cứu: chat có nạp ngữ cảnh (dữ liệu app đã tra) + phân tích feedback.
+app.post('/api/assistant/chat', requireApprovedUser, async (req, res) => {
+  const { model, messages, contextText, drugName, dosageForm } = req.body;
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'Thiếu nội dung hội thoại (messages)' });
+  }
+  const ctx = String(contextText || '').slice(0, 40000);
+  const system = {
+    role: 'system',
+    content: `Bạn là CHUYÊN GIA BÀO CHẾ DƯỢC, đóng vai trợ lý nghiên cứu cho một dược sĩ R&D.
+Hoạt chất đang nghiên cứu: "${drugName || '(chưa rõ)'}"${dosageForm ? ` — dạng bào chế: "${dosageForm}"` : ''}.
+
+QUY TẮC:
+1. Dùng phần "NGỮ CẢNH" dưới đây (dữ liệu app đã tra cứu được) làm CĂN CỨ CHÍNH. Khi ngữ cảnh có số liệu (độ tan, độ ổn định, tương kỵ, công thức tham khảo, tiêu chuẩn dược điển...), hãy bám vào đó.
+2. Được phép đưa ra ĐỀ XUẤT công thức pha chế & quy trình sản xuất THỰC TẾ, chi tiết, khả thi (thành phần + vai trò + tỉ lệ gợi ý, các bước, thông số, kiểm soát trọng yếu).
+3. Phân biệt RÕ: điều nào có bằng chứng từ ngữ cảnh/tài liệu, điều nào là PHÁN ĐOÁN CHUYÊN MÔN cần thực nghiệm xác nhận. TUYỆT ĐỐI KHÔNG bịa số liệu hay trích dẫn nguồn giả.
+4. Khi người dùng feedback KẾT QUẢ PHA CHẾ THỰC TẾ (vd vón cục, tách lớp, không rã...), phân tích nguyên nhân khả dĩ và ĐIỀU CHỈNH đề xuất cho phù hợp.
+5. Trả lời bằng tiếng Việt, trình bày rõ ràng (gạch đầu dòng/bảng khi hợp lý).
+
+===== NGỮ CẢNH (dữ liệu đã nạp) =====
+${ctx || '(Người dùng chưa nạp dữ liệu mục nào — hãy trả lời dựa trên kiến thức chung và nêu rõ giả định.)'}
+===== HẾT NGỮ CẢNH =====`,
+  };
+  try {
+    const chatMsgs = messages
+      .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
+      .map((m) => ({ role: m.role, content: String(m.content) }));
+    const reply = await callOpenAI(openaiKey, [system, ...chatMsgs], model || 'deepseek/deepseek-chat', 3, 8000);
+    res.json({ reply });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Phương án DỰ PHÒNG khi PharmDE sập: dùng DeepSeek :online phân tích tương tác hoạt chất–tá dược
 // từ tài liệu thật (Handbook of Pharmaceutical Excipients, nghiên cứu compatibility/DSC/stress...),
 // trả về ĐÚNG shape mà frontend đang render + kèm nguồn trích dẫn. TUYỆT ĐỐI không bịa.

@@ -17,6 +17,8 @@ const state = {
   sraData: null,
   patentData: null,
   pharmaData: null,
+  assistantMessages: [],
+  assistantChatId: null,
 };
 
 // ── Protocol builder: chọn thông tin (ô tick) → xuất file Word (.docx) ─────────
@@ -428,6 +430,144 @@ function imgProxy(url) {
   return url;
 }
 
+// ── Trợ lý AI nghiên cứu ─────────────────────────────────────────────────────
+const ASSISTANT_CTX_MAP = {
+  clinical: ['clinicalData'], drug: ['aiAnalysis', 'pubchemData'], stability: ['stabilityData'],
+  sra: ['sraData'], patents: ['patentData'], pharma: ['pharmaData'], compat: ['compatibilityData'],
+};
+const ASSISTANT_CTX_LABEL = {
+  clinical: 'Dược lý & bào chế', drug: 'Đặc điểm hoạt chất', stability: 'Độ ổn định',
+  sra: 'Công thức tham khảo', patents: 'Patent', pharma: 'Dược điển', compat: 'Tương tác tá dược',
+};
+
+// Gom dữ liệu các mục được tick thành text để nạp làm ngữ cảnh cho AI.
+function assistantBuildContext() {
+  const checked = Array.from(document.querySelectorAll('.asst-ctx-cb:checked')).map((cb) => cb.value);
+  let out = '';
+  for (const sec of checked) {
+    let secText = '';
+    for (const f of (ASSISTANT_CTX_MAP[sec] || [])) {
+      const v = state[f];
+      if (v != null && !(Array.isArray(v) && v.length === 0)) {
+        try { secText += JSON.stringify(v) + '\n'; } catch (e) {}
+      }
+    }
+    if (secText.trim()) out += `\n### ${ASSISTANT_CTX_LABEL[sec] || sec}\n${secText}`;
+  }
+  return out.slice(0, 40000);
+}
+
+function assistantRender(typing) {
+  const log = document.getElementById('asst-log');
+  if (!log) return;
+  if (!state.assistantMessages.length && !typing) {
+    log.innerHTML = '<div class="asst-empty">Chưa có hội thoại. Hãy tick dữ liệu cần nạp rồi đặt câu hỏi bên dưới.</div>';
+    return;
+  }
+  let html = state.assistantMessages.map((m) =>
+    `<div class="asst-msg ${m.role === 'user' ? 'asst-user' : 'asst-ai'}"><div class="asst-bubble">${escHtml(m.content).replace(/\n/g, '<br>')}</div></div>`
+  ).join('');
+  if (typing) html += '<div class="asst-msg asst-ai"><div class="asst-bubble asst-typing">⏳ Đang trả lời...</div></div>';
+  log.innerHTML = html;
+  log.scrollTop = log.scrollHeight;
+}
+
+async function assistantSend() {
+  const inp = document.getElementById('asst-input');
+  const text = (inp.value || '').trim();
+  if (!text) return;
+  const sendBtn = document.getElementById('asst-send');
+  state.assistantMessages.push({ role: 'user', content: text });
+  inp.value = '';
+  assistantRender(true);
+  if (sendBtn) sendBtn.disabled = true;
+  try {
+    const model = document.getElementById('asst-model')?.value || 'deepseek/deepseek-chat';
+    const data = await api('/api/assistant/chat', {
+      model,
+      messages: state.assistantMessages,
+      contextText: assistantBuildContext(),
+      drugName: state.drugName,
+      dosageForm: state.dosageForm,
+      openaiKey: state.openaiKey || undefined,
+    });
+    state.assistantMessages.push({ role: 'assistant', content: data.reply || '(không có nội dung)' });
+    assistantRender();
+    assistantSave();
+  } catch (e) {
+    state.assistantMessages.push({ role: 'assistant', content: '⚠️ Lỗi: ' + e.message });
+    assistantRender();
+  } finally {
+    if (sendBtn) sendBtn.disabled = false;
+  }
+}
+
+function assistantNewChat() {
+  state.assistantMessages = [];
+  state.assistantChatId = null;
+  const sel = document.getElementById('asst-saved');
+  if (sel) sel.value = '';
+  assistantRender();
+}
+
+// Tự lưu hội thoại (upsert) vào assistant_chats — client dùng anon key + RLS.
+async function assistantSave() {
+  if (!supabase || !state.assistantMessages.length) return;
+  try {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (!session) return;
+    if (!state.assistantChatId) {
+      const { data, error } = await supabase.from('assistant_chats').insert({
+        user_id: session.user.id,
+        drug_name: state.drugName,
+        dosage_form: state.dosageForm,
+        model: document.getElementById('asst-model')?.value || 'deepseek/deepseek-chat',
+        messages: state.assistantMessages,
+      }).select('id').single();
+      if (!error && data) { state.assistantChatId = data.id; loadAssistantChats(); }
+    } else {
+      await supabase.from('assistant_chats').update({
+        messages: state.assistantMessages,
+        updated_at: new Date().toISOString(),
+      }).eq('id', state.assistantChatId);
+    }
+  } catch (e) { /* best-effort, không chặn UI */ }
+}
+
+async function loadAssistantChats() {
+  if (!supabase || !currentProfile) return;
+  const sel = document.getElementById('asst-saved');
+  if (!sel) return;
+  try {
+    const { data, error } = await supabase.from('assistant_chats')
+      .select('id, drug_name, updated_at').order('updated_at', { ascending: false }).limit(50);
+    if (error) return;
+    const opts = ['<option value="">— Hội thoại mới —</option>'].concat(
+      (data || []).map((r) => `<option value="${r.id}">${escHtml(r.drug_name || 'Hội thoại')} · ${escHtml(formatHistoryDate(r.updated_at))}</option>`)
+    );
+    sel.innerHTML = opts.join('');
+    sel.value = state.assistantChatId || '';
+  } catch (e) {}
+}
+
+async function openAssistantChat(id) {
+  if (!id) { assistantNewChat(); return; }
+  if (!supabase) return;
+  try {
+    const { data, error } = await supabase.from('assistant_chats')
+      .select('messages, drug_name, dosage_form').eq('id', id).single();
+    if (error || !data) return;
+    state.assistantMessages = Array.isArray(data.messages) ? data.messages : [];
+    state.assistantChatId = id;
+    assistantRender();
+  } catch (e) {}
+}
+
+// Enter để gửi (Shift+Enter xuống dòng). app.js chạy sau khi DOM đã sẵn.
+document.getElementById('asst-input')?.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); assistantSend(); }
+});
+
 // ── Drug Name Suggestion Modal ────────────────────────────────────────────────
 
 function showConfirmModal(title, message, confirmLabel = 'Tiếp tục', cancelLabel = 'Hủy') {
@@ -799,6 +939,7 @@ async function initAuthGate() {
   currentProfile = profile;
   removeAuthOverlay();
   updateUserBadge();
+  loadAssistantChats();
   hide('empty-state');
   show('results-section');
   if (profile.role === 'admin') show('sidebar-admin-btn'); else hide('sidebar-admin-btn');
@@ -902,6 +1043,8 @@ async function startSearch() {
   clearProtocolItems();
   // Xoá badge double-check của lượt trước (không để dính sang hoạt chất mới).
   document.querySelectorAll('.dc-result').forEach((el) => { el.innerHTML = ''; });
+  // Bắt đầu hội thoại Trợ lý AI mới cho hoạt chất mới (bản đã lưu vẫn còn trong DB).
+  assistantNewChat();
 
   // Reset UI và ẩn các card kết quả từ lượt tìm kiếm trước
   hide('empty-state');
