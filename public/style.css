@@ -450,19 +450,17 @@ select.input-field:invalid { color: var(--text-3); }
 
 /* ── Tabs ──────────────────────────────────────────────────────────────── */
 .tabs-wrap {
-  display: flex;
-  flex-wrap: nowrap;               /* luôn 1 dòng */
-  gap: clamp(8px, 1.1vw, 28px);    /* khoảng cách tự co theo màn hình */
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);  /* cố định 4 cột → 8 tab thành 4 trên / 4 dưới */
+  gap: 0.5rem 1rem;
   background: transparent;
   border: none;
   border-bottom: 1px solid var(--card-border);
   padding: 0;
   margin-bottom: 1.5rem;
-  overflow-x: auto;                /* dự phòng: màn cực nhỏ thì cuộn ngang, không cắt cụt */
-  scrollbar-width: thin;
 }
-.tabs-wrap::-webkit-scrollbar { height: 4px; }
-.tabs-wrap::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 4px; }
+/* Trong lưới: cho nhãn tab tự xuống dòng trong ô, không tràn */
+.tabs-wrap .tab-btn { white-space: normal; text-align: center; min-width: 0; }
 
 .tab-btn {
   flex: none;
@@ -1027,6 +1025,7 @@ select.input-field:invalid { color: var(--text-3); }
   .search-sections-grid { grid-template-columns: 1fr; }
   .hero { padding: 2rem 1rem 1.5rem; }
   .main-content { padding: 0 1rem 3rem; }
+  .tabs-wrap { grid-template-columns: repeat(2, 1fr); }  /* điện thoại: 2 cột cho đỡ chật */
 }
 
 /* ── Misc Utils ────────────────────────────────────────────────────────── */
@@ -1278,6 +1277,8 @@ select.input-field:invalid { color: var(--text-3); }
 .asst-user .asst-bubble { background: var(--grad-primary, linear-gradient(90deg,#2563eb,#7c3aed)); color: #fff; border-bottom-right-radius: 4px; }
 .asst-ai .asst-bubble { background: #fff; border: 1px solid var(--card-border); color: var(--text-1); border-bottom-left-radius: 4px; }
 .asst-typing { color: var(--text-3); font-style: italic; }
+.asst-bubble strong { font-weight: 700; }
+.asst-hr { border: none; border-top: 1px solid var(--card-border); margin: 8px 0; }
 
 .asst-inputbar { display: flex; gap: 0.6rem; margin-top: 0.9rem; align-items: flex-end; }
 .asst-inputbar textarea {

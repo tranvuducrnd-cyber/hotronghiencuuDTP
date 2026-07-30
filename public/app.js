@@ -457,6 +457,17 @@ function assistantBuildContext() {
   return out.slice(0, 40000);
 }
 
+// Chuyển Markdown gọn → HTML (bỏ dấu * và #, biến thành đậm/tiêu đề/đường kẻ).
+function mdToHtml(text) {
+  let s = escHtml(String(text || ''));
+  s = s.replace(/^\s{0,3}#{1,6}\s*(.+?)\s*$/gm, '<strong>$1</strong>'); // tiêu đề # → đậm, bỏ #
+  s = s.replace(/^\s*[-*_]{3,}\s*$/gm, '<hr class="asst-hr">');          // --- *** ___ → đường kẻ
+  s = s.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');               // **đậm**
+  s = s.replace(/\*/g, '');                                             // bỏ dấu * còn sót
+  s = s.replace(/\n/g, '<br>');
+  return s;
+}
+
 function assistantRender(typing) {
   const log = document.getElementById('asst-log');
   if (!log) return;
@@ -464,9 +475,12 @@ function assistantRender(typing) {
     log.innerHTML = '<div class="asst-empty">Chưa có hội thoại. Hãy tick dữ liệu cần nạp rồi đặt câu hỏi bên dưới.</div>';
     return;
   }
-  let html = state.assistantMessages.map((m) =>
-    `<div class="asst-msg ${m.role === 'user' ? 'asst-user' : 'asst-ai'}"><div class="asst-bubble">${escHtml(m.content).replace(/\n/g, '<br>')}</div></div>`
-  ).join('');
+  let html = state.assistantMessages.map((m) => {
+    const body = m.role === 'user'
+      ? escHtml(m.content).replace(/\n/g, '<br>')
+      : mdToHtml(m.content);
+    return `<div class="asst-msg ${m.role === 'user' ? 'asst-user' : 'asst-ai'}"><div class="asst-bubble">${body}</div></div>`;
+  }).join('');
   if (typing) html += '<div class="asst-msg asst-ai"><div class="asst-bubble asst-typing">⏳ Đang trả lời...</div></div>';
   log.innerHTML = html;
   log.scrollTop = log.scrollHeight;
