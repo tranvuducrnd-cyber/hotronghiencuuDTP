@@ -1506,7 +1506,14 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     // Sắp xếp đưa thuốc đơn chất (mono-preparation) lên trước
     targetLinks.sort((a, b) => (b.isMono ? 1 : 0) - (a.isMono ? 1 : 0));
 
-    // Chạy toàn bộ sản phẩm tìm được, không giới hạn số lượng.
+    // Giới hạn số sản phẩm xử lý để chạy NHANH & tránh request quá lâu bị cắt.
+    // Đã ưu tiên đơn chất lên đầu nên phần giữ lại là các sản phẩm phù hợp nhất.
+    const MAX_PRODUCTS = 15;
+    if (targetLinks.length > MAX_PRODUCTS) {
+      console.log(`[Vidal] Giới hạn ${targetLinks.length} -> ${MAX_PRODUCTS} sản phẩm để tăng tốc.`);
+      targetLinks = targetLinks.slice(0, MAX_PRODUCTS);
+    }
+
     const productData = [];
     const chunkSize = 3;
     const chunks = [];

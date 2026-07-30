@@ -416,9 +416,37 @@ async function api(endpoint, body) {
     headers,
     body: JSON.stringify(body),
   });
-  const data = await res.json();
+  // Đọc dạng text trước để xử lý được cả trường hợp body RỖNG (request bị cắt/quá thời gian)
+  // hoặc không phải JSON — tránh lỗi khó hiểu "Unexpected end of JSON input".
+  const raw = await res.text();
+  let data = {};
+  if (raw) {
+    try { data = JSON.parse(raw); }
+    catch (e) { throw new Error(`Máy chủ trả về dữ liệu không hợp lệ (HTTP ${res.status}). Có thể do quá thời gian — vui lòng thử lại.`); }
+  } else if (!res.ok) {
+    throw new Error(`Máy chủ không phản hồi (HTTP ${res.status}). Có thể do quá thời gian hoặc đang khởi động — vui lòng thử lại.`);
+  } else {
+    throw new Error('Máy chủ trả về rỗng — có thể request quá lâu bị cắt. Vui lòng thử lại.');
+  }
   if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
   return data;
+}
+
+// Gọi api() có tự thử lại khi lỗi (dùng cho route chậm/chập chờn như đề xuất công thức).
+async function apiWithRetry(endpoint, body, tries = 3, delayMs = 3000, onRetry) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await api(endpoint, body);
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) {
+        if (onRetry) onRetry(i + 1, tries - 1);
+        await new Promise((r) => setTimeout(r, delayMs));
+      }
+    }
+  }
+  throw lastErr;
 }
 
 // Cho ảnh ngoài đi qua proxy server để tránh bị chặn CORP/hotlink (vd ResearchGate).
@@ -821,7 +849,13 @@ function showPendingScreen(status) {
 }
 
 async function handleLogout() {
-  await supabase.auth.signOut();
+  // scope:'local' chỉ xoá phiên ở máy, KHÔNG gọi server revoke (tránh lỗi khi token đã hỏng
+  // khiến không đăng xuất được). Sau đó xoá sạch khoá phiên Supabase còn sót rồi tải lại.
+  try { await supabase.auth.signOut({ scope: 'local' }); } catch (e) {}
+  try {
+    Object.keys(localStorage).forEach((k) => { if (/^sb-|supabase/i.test(k)) localStorage.removeItem(k); });
+  } catch (e) {}
+  location.reload();
 }
 
 // ── Đổi mật khẩu ──────────────────────────────────────────────────────────
@@ -1204,11 +1238,16 @@ async function startSearch() {
     const runSRA = async () => {
       setStepStatus('step-sra', 'active');
       try {
-        state.sraData = await api('/api/sra-formulas', { drugName, dosageForm, openaiKey, searchId });
+        state.sraData = await apiWithRetry(
+          '/api/sra-formulas',
+          { drugName, dosageForm, openaiKey, searchId },
+          3, 3000,
+          (n, max) => setStepStatus('step-sra', 'active', `Chậm/lỗi — tự thử lại lần ${n}/${max}...`),
+        );
         setStepStatus('step-sra', 'done', `${state.sraData.totalProducts || (state.sraData.products || []).length} sản phẩm`);
         renderSRATab();
       } catch (e) {
-        setStepStatus('step-sra', 'error', e.message);
+        setStepStatus('step-sra', 'error', e.message + ' (đã tự thử lại nhưng vẫn lỗi)');
         renderSRAError(e.message);
       }
     };
