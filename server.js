@@ -1515,7 +1515,7 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     }
 
     const productData = [];
-    const chunkSize = 3;
+    const chunkSize = 6;   // tải 6 sản phẩm/lô (trước là 3) → ít lô hơn, nhanh hơn
     const chunks = [];
     for (let i = 0; i < targetLinks.length; i += chunkSize) {
       chunks.push(targetLinks.slice(i, i + chunkSize));
@@ -1545,7 +1545,7 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
           console.error('Error fetching vidal product:', link.url, e.message);
         }
       }));
-      await delay(1500); // Nghỉ 1.5s sau mỗi batch để tránh 429
+      await delay(700); // Nghỉ 0.7s sau mỗi batch (trước 1.5s) — nhanh hơn, vẫn có retry 429
     }
 
     // 3. Sử dụng AI để dịch và lọc theo dạng bào chế
@@ -1554,7 +1554,7 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     updateProgress(searchId, 'vidal', 80, 'Đang gửi dữ liệu tiếng Nga tới OpenAI để dịch...');
     // Ưu tiên công thức ĐƠN CHẤT: xếp lên trước công thức phối hợp (giữ đúng thứ tự khi chia lô AI).
     productData.sort((a, b) => (b.isMono ? 1 : 0) - (a.isMono ? 1 : 0));
-    const BATCH_SIZE = 8;
+    const BATCH_SIZE = 10;   // mỗi lô đẩy vào AI 10 sản phẩm (trước 8) — ít lượt gọi hơn, các lô vẫn dịch song song
     const productBatches = [];
     for (let i = 0; i < productData.length; i += BATCH_SIZE) {
       productBatches.push(productData.slice(i, i + BATCH_SIZE));
