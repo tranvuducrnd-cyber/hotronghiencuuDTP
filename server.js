@@ -2216,18 +2216,37 @@ function patentCoreId(raw) {
 // So sánh BEST-EFFORT xem applicant của 1 patent có vẻ KHÁC hãng phát minh (originator) đã xác
 // định không — để cảnh báo minh bạch (KHÔNG tự động loại patent, vì so khớp tên công ty rất dễ
 // sai — tên viết tắt, công ty con, đổi tên qua thời gian...).
-function companiesLikelyDiffer(applicant, originator) {
-  if (!applicant || !originator) return false; // thiếu dữ liệu để so sánh -> không cảnh báo oan
+// So sánh applicant với DANH SÁCH các dòng hãng gốc → 'same' | 'different' | 'unknown'.
+//
+// Vì sao phải có trạng thái 'unknown' riêng: bản cũ trả về false ("không khác nhau") cho cả trường
+// hợp KHÔNG SO SÁNH ĐƯỢC — mà nơi gọi lại hiểu false = đúng hãng gốc. Hệ quả: mọi patent không lấy
+// được tên chủ sở hữu, hoặc tên viết bằng chữ phi Latin (Hàn/Nga/Nhật/Trung — bị hàm chuẩn hoá xoá
+// sạch thành chuỗi rỗng), đều lọt vào danh sách như thể là patent chính chủ. Đó chính là đường mà
+// WO2013100873A1 (của cá nhân Mahmut Bilgic) lọt vào kết quả tra pregabalin của Pfizer.
+function compareCompany(applicant, originators) {
+  const list = (originators || []).filter(Boolean);
+  if (!applicant || !list.length) return 'unknown';
   const norm = (s) => String(s).toUpperCase()
     .replace(/\b(LLC|INC|CORP(?:ORATION)?|CO|LTD|GMBH|AG|THE|LABORATORIES|LABS?|PHARMACEUTICALS?|PHARMA)\b/g, '')
     .replace(/[^A-Z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
-  const a = norm(applicant), o = norm(originator);
-  if (!a || !o) return false;
-  if (a.includes(o) || o.includes(a)) return false; // 1 chuỗi chứa chuỗi kia -> coi như cùng hãng
-  const aWords = a.split(' ').filter((w) => w.length >= 4);
-  const oWords = o.split(' ').filter((w) => w.length >= 4);
-  if (aWords.some((w) => oWords.includes(w))) return false; // có từ chung đáng kể -> không cảnh báo
-  return true;
+  // `applicant` có thể là danh sách nhiều chủ sở hữu nối bằng " · " — xét TỪNG cái, tránh trộn tên
+  // người với tên công ty thành một chuỗi vô nghĩa.
+  const applicants = String(applicant).split('·').map((s) => s.trim()).filter(Boolean);
+  let comparable = 0;
+  for (const one of applicants) {
+    const a = norm(one);
+    if (!a) continue; // tên phi Latin -> bỏ qua, KHÔNG được coi là khớp
+    for (const originator of list) {
+      const o = norm(originator);
+      if (!o) continue;
+      comparable++;
+      if (a.includes(o) || o.includes(a)) return 'same';
+      const aWords = a.split(' ').filter((w) => w.length >= 4);
+      const oWords = o.split(' ').filter((w) => w.length >= 4);
+      if (aWords.some((w) => oWords.includes(w))) return 'same';
+    }
+  }
+  return comparable ? 'different' : 'unknown';
 }
 
 // Nguồn 1: Serper (Google search) — thực nghiệm cho kết quả ĐÚNG NHẤT, kể cả patent đã hết hạn
@@ -2325,7 +2344,13 @@ async function findCandidatesViaAI(drugName, dosageFormVi, openaiKey) {
 //                cảnh báo thay vì âm thầm loại bỏ.
 async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
   const id = normalizePatentId(patentNumber);
-  if (!/^(US|EP|WO|CA|CN)[A-Z0-9]+$/i.test(id)) {
+  // Chấp nhận MỌI cơ quan sáng chế: 2 chữ cái mã nước/khu vực + phần còn lại là chữ/số.
+  // Bản cũ chỉ cho US|EP|WO|CA|CN nên đã loại oan hàng loạt patent CÓ THẬT của JP/KR/EA/CZ/MX —
+  // trong đó có KR20010043611A của chính Warner-Lambert (patent hãng gốc pregabalin) và
+  // EA017542B1 (công thức viên nang pregabalin). Vẫn đủ chặt để chặn chuỗi rác AI bịa ra.
+  // Phải có ít nhất 1 CHỮ SỐ — mã patent thật luôn chứa số; nếu không, chuỗi chữ cái bất kỳ do AI
+  // bịa ra (vd "KHONGPHAIMA") cũng sẽ lọt qua.
+  if (!/^[A-Z]{2}[A-Z0-9]{3,}$/i.test(id) || !/\d/.test(id)) {
     return { status: 'rejected', reason: 'Mã patent không hợp lệ' };
   }
   // Nếu snippet/title từ Serper đã nhắc rõ hoạt chất, dùng luôn làm bằng chứng sơ bộ để giảm số
@@ -2335,7 +2360,9 @@ async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
   const hintMatches = drugUpper && hintText.includes(drugUpper);
 
   const url = `https://patents.google.com/patent/${id}/en`;
-  const maxRetries = 2;
+  // 3 lượt thử: Google Patents hay chặn tạm (503) khi bị gọi nhiều; thử lại có giãn cách tăng dần
+  // giúp lấy được trang thật (và nhờ đó lấy được TÊN CHỦ SỞ HỮU) thay vì rơi vào nhánh dự phòng.
+  const maxRetries = 3;
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
       const r = await axios.get(url, {
@@ -2360,20 +2387,51 @@ async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
       const title = ($('meta[name="DC.title"]').attr('content')
         || $('span[itemprop="title"]').first().text()
         || '').replace(/\s+/g, ' ').trim().slice(0, 200);
-      // Lấy CHỦ SỞ HỮU THẬT (assignee) ngay trong lúc đối chiếu — vì trang đã tải rồi, tận dụng
-      // luôn thay vì để trống. Đây là bản vá cho lỗi: patent tìm qua Serper không có applicant,
-      // khiến giao diện ẩn trường "Người nộp" và gây hiểu lầm patent thuộc về hãng gốc trong khi
-      // thực ra là của hãng khác (vd 4 patent hiện dưới "McNeil — Tylenol" hoá ra là của GSK/hãng TQ).
-      // DC.contributor liệt kê CẢ nhà phát minh lẫn công ty — ưu tiên mục nào có đuôi tên công ty.
-      const contributors = $('meta[name="DC.contributor"]').map((_, x) => $(x).attr('content')).get()
-        .map((s) => (s || '').trim()).filter(Boolean);
-      const companyPattern = /\b(LLC|Inc|Corp|Corporation|Co\.?|Ltd|GmbH|AG|Laboratories|Pharma|Pharmaceuticals?|University|Institute|S\.A\.|N\.V\.)\b/i;
-      const realApplicant = contributors.find((c) => companyPattern.test(c))
-        || (contributors.length && contributors[contributors.length - 1] !== 'Individual' ? contributors[contributors.length - 1] : '');
+      // Lấy CHỦ SỞ HỮU THẬT (assignee) ngay trong lúc đối chiếu — trang đã tải rồi nên tận dụng luôn.
+      //
+      // BẮT BUỘC lọc bỏ phần tử nằm trong <td>: trang Google Patents có bảng "patent cùng họ /
+      // trích dẫn" ở dưới, mỗi dòng cũng mang itemprop="assigneeOriginal". Đã đếm trên US8461210B2:
+      // 46 phần tử assigneeOriginal nhưng CHỈ phần tử đầu (nằm thẳng trong <article>) là của chính
+      // patent này; 45 phần tử còn lại nằm trong <td> và thuộc về Bayer/Novartis/Teva/các hãng TQ...
+      // Lấy bừa sẽ GÁN NHẦM TÊN CÔNG TY KHÁC cho patent đang xét.
+      const ownOf = (prop) => $(`[itemprop="${prop}"]`)
+        .filter((_, el) => $(el).closest('td').length === 0)
+        .map((_, el) => $(el).text().replace(/\s+/g, ' ').trim()).get()
+        .filter(Boolean);
+
+      const isPlaceholder = (s) => /^individual$/i.test(s);
+      const assignees = [...ownOf('assigneeCurrent'), ...ownOf('assigneeOriginal')]
+        .filter((s, i, arr) => arr.indexOf(s) === i);
+      const realCompanies = assignees.filter((s) => !isPlaceholder(s));
+
+      let realApplicant = '';
+      let applicantNote = '';
+      if (realCompanies.length) {
+        // GIỮ ĐỦ danh sách chủ sở hữu thay vì chỉ lấy phần tử đầu. Lý do: một patent có thể ghi cả
+        // nhà phát minh (đã chuyển nhượng) LẪN công ty. Vd KR20010043611A liệt kê
+        // ["로즈 암스트롱, 크리스틴 에이. 트러트웨인" (tên người), "워너-램버트 캄파니" (Warner-Lambert)]
+        // — lấy phần tử đầu sẽ ra tên người và BỎ SÓT chính hãng gốc. Không thể đoán phần tử nào là
+        // công ty vì tên viết bằng chữ Hàn/Nga (mẫu nhận dạng "Ltd/Inc/..." vô dụng), nên liệt kê đủ
+        // để cả bước so khớp bằng code lẫn AI đều nhìn thấy.
+        realApplicant = realCompanies.slice(0, 3).join(' · ');
+      } else if (assignees.length) {
+        // Google ghi "Individual" = patent thuộc CÁ NHÂN, không phải công ty. Trước đây trường hợp
+        // này bị trả về chuỗi rỗng → giao diện hiện "(không xác định được)" dù tên chủ sở hữu hoàn
+        // toàn lấy được từ mục inventor. Nêu rõ là cá nhân để người dùng đánh giá đúng.
+        const inventors = ownOf('inventor');
+        if (inventors.length) { realApplicant = inventors[0]; applicantNote = 'cá nhân'; }
+      }
+      if (!realApplicant) {
+        // Phương án cuối: DC.contributor (gộp cả nhà phát minh lẫn công ty, kém chính xác hơn).
+        const contributors = $('meta[name="DC.contributor"]').map((_, x) => $(x).attr('content')).get()
+          .map((s) => (s || '').trim()).filter(Boolean).filter((s) => !isPlaceholder(s));
+        if (contributors.length) realApplicant = contributors[contributors.length - 1];
+      }
+
       if (drugUpper && !body.includes(drugUpper)) {
         return { status: 'rejected', reason: `Nội dung patent không nhắc tới "${drugName}"`, realTitle: title };
       }
-      return { status: 'verified', realTitle: title, realApplicant, verifiedUrl: url };
+      return { status: 'verified', realTitle: title, realApplicant, applicantNote, verifiedUrl: url };
     } catch (e) {
       if (attempt < maxRetries - 1) { await delay(1000); continue; }
       return hintMatches
@@ -2424,13 +2482,24 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
       });
     }
 
-    // BƯỚC 2 — xác minh TỪNG ứng viên (song song). Orange Book đã là nguồn chính thức, bỏ qua bước
-    // đối chiếu Google Patents (officialVerified).
-    const verifications = await Promise.all(candidates.map((c) =>
-      c.officialVerified
-        ? Promise.resolve({ status: 'verified', realTitle: c.title, verifiedUrl: c.sourceUrl, official: true })
-        : verifyPatentAgainstGooglePatents(c.patentNumber, drugName, c)
-    ));
+    // BƯỚC 2 — xác minh TỪNG ứng viên. Orange Book đã là nguồn chính thức nên bỏ qua bước đối chiếu.
+    //
+    // CHIA LÔ NHỎ CÓ GIÃN CÁCH — không được dùng Promise.all cho tất cả: bắn ~30 request cùng lúc
+    // khiến Google Patents chặn tạm (503) ngay từ lô đầu, mọi patent rơi vào nhánh dự phòng và
+    // KHÔNG lấy được tên chủ sở hữu (đã tái hiện: 16/16 patent trống "Người nộp", còn Google trả
+    // 503 liên tục sau đó). Chậm hơn vài giây nhưng đổi lại có dữ liệu thật.
+    const VERIFY_BATCH = 3;
+    const verifications = [];
+    for (let i = 0; i < candidates.length; i += VERIFY_BATCH) {
+      const batch = candidates.slice(i, i + VERIFY_BATCH);
+      const res = await Promise.all(batch.map((c) =>
+        c.officialVerified
+          ? Promise.resolve({ status: 'verified', realTitle: c.title, verifiedUrl: c.sourceUrl, official: true })
+          : verifyPatentAgainstGooglePatents(c.patentNumber, drugName, c)
+      ));
+      verifications.push(...res);
+      if (i + VERIFY_BATCH < candidates.length) await delay(900);
+    }
 
     const verifiedList = [];
     const rejectedList = [];
@@ -2444,6 +2513,7 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
         // applicant sẵn nên trước đây bị bỏ trống, khiến người dùng không thấy patent thực ra
         // thuộc hãng khác (không phải hãng phát minh gốc).
         applicant: v.realApplicant || c.applicant || '',
+        applicantNote: v.applicantNote || '', // vd 'cá nhân' khi patent thuộc một người, không phải công ty
         sourceUrl: v.verifiedUrl || c.sourceUrl,
         verifyStatus: v.status,
       });
@@ -2494,8 +2564,13 @@ NHIỆM VỤ:
    - CHỈ liệt kê dòng có căn cứ hợp lý; không bịa chuỗi M&A không có thật. Thà liệt kê THIẾU còn hơn
      liệt kê SAI (thêm nhầm hãng generic vào danh sách hãng phát minh).
 2. Với MỖI patent trong danh sách: xác định "isFormulation" (true nếu là patent DẠNG BÀO CHẾ — công thức, dạng tinh thể/polymorph, bao phim, giải phóng kiểm soát, quy trình sản xuất; false nếu là patent hợp chất cơ bản/phương pháp điều trị/không liên quan bào chế), "patentType" (Dạng tinh thể|Công thức bào chế|Bao phim|Giải phóng kiểm soát|Quy trình sản xuất|Khác), "status" (còn hạn|hết hạn|không rõ).
+3. Với MỖI patent, xác định thêm "sameAsOriginator": chủ sở hữu (phần cuối mỗi dòng, sau dấu "—") có thuộc một trong các dòng hãng gốc ở mục 1 không?
+   - QUAN TRỌNG: tên chủ sở hữu có thể viết bằng chữ KHÔNG PHẢI LATIN hoặc dạng phiên âm — phải nhận ra chúng là cùng một công ty. Ví dụ: "워너-램버트 캄파니" (Hàn) = "Warner-Lambert Company"; "Плива Кроэйша Лтд." (Nga) = "Pliva Croatia Ltd"; tên chữ Hán/Nhật tương tự.
+   - true = đúng là hãng gốc (hoặc công ty con/bên kế thừa hợp pháp của hãng gốc).
+   - false = chắc chắn là bên khác (hãng generic, cá nhân, trường đại học, công ty không liên quan).
+   - null = KHÔNG CHẮC. Thà trả null còn hơn đoán bừa.
 TUYỆT ĐỐI KHÔNG thêm patent nào ngoài danh sách được cho. CHỈ dùng đúng các mã patent đã cho.
-Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"overallNote":"...","items":{"<patentNumber>":{"isFormulation":true,"patentType":"...","status":"..."}}}`,
+Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"overallNote":"...","items":{"<patentNumber>":{"isFormulation":true,"patentType":"...","status":"...","sameAsOriginator":true}}}`,
         },
         { role: 'user', content: `Hoạt chất: "${drugName}"${dosageForm ? `, dạng bào chế: "${dosageForm}"` : ''}.\n\nDanh sách patent đã xác minh:\n${listText}` },
       ], 'deepseek/deepseek-chat', 3, 4000);
@@ -2531,13 +2606,33 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
     const originatorCompanies = classification.originators.map((o) => o.company).filter(Boolean);
     const applyClassification = (p) => {
       const cls = classification.items[p.patentNumber] || classification.items[normalizePatentId(p.patentNumber)];
+
+      // Đối chiếu chủ sở hữu với các dòng hãng gốc theo 2 lớp:
+      //  1) So khớp bằng CODE (nhanh, kiểm chứng được) — nhưng bó tay với tên phi Latin.
+      //  2) AI đối chiếu (nhận ra "워너-램버트 캄파니" = "Warner-Lambert Company") — chỉ dùng khi
+      //     code không kết luận được, và AI được phép trả null nếu không chắc.
+      const byCode = compareCompany(p.applicant, originatorCompanies);
+      const aiSays = cls && typeof cls.sameAsOriginator === 'boolean' ? cls.sameAsOriginator : null;
+      let ownerMatch = byCode;           // 'same' | 'different' | 'unknown'
+      let ownerMatchBy = 'code';
+      // CHỈ tin AI khi thực sự CÓ tên chủ sở hữu để đối chiếu. Nếu trường applicant rỗng (vd Google
+      // Patents đang chặn tạm nên không tải được trang), AI không có căn cứ nào cả — đã tái hiện:
+      // nó phán "không phải hãng gốc" cho toàn bộ 26 patent và danh sách chính trống trơn. Không có
+      // dữ liệu thì phải để 'unknown' và giữ patent kèm nhãn, tuyệt đối không đoán rồi ẩn đi.
+      if (byCode === 'unknown' && aiSays !== null && p.applicant) {
+        ownerMatch = aiSays ? 'same' : 'different';
+        ownerMatchBy = 'ai';
+      }
+
       return Object.assign({}, p, {
         patentType: cls?.patentType || 'Chưa phân loại',
         status: cls?.status || '',
         isFormulation: cls ? !!cls.isFormulation : true, // không rõ -> vẫn giữ, coi là có thể liên quan
-        // KHÁC hãng = applicant CÓ dữ liệu và khác TẤT CẢ các dòng hãng gốc hợp pháp — best-effort.
-        differentCompany: originatorCompanies.length > 0 && !!p.applicant
-          && originatorCompanies.every((oc) => companiesLikelyDiffer(p.applicant, oc)),
+        ownerMatch,
+        ownerMatchBy,
+        // CHỈ ẩn khi kết luận CHẮC CHẮN là hãng khác. Trạng thái 'unknown' được GIỮ LẠI kèm nhãn —
+        // trước đây 'unknown' bị âm thầm coi là khớp, khiến patent của cá nhân/hãng lạ lọt vào.
+        differentCompany: originatorCompanies.length > 0 && ownerMatch === 'different',
       });
     };
     // Người dùng yêu cầu: CHỈ hiện patent khớp với nhà sản xuất biệt dược gốc — patent xác định

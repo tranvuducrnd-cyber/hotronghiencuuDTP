@@ -520,26 +520,53 @@ const SOURCE_TLD_RULES = [
   { test: (h) => /\.edu(\.[a-z]{2})?$/.test(h) || /\.ac\.[a-z]{2}$/.test(h), tier: 2 },
 ];
 
-// Nhận {url, title, doi?} — danh sách nào không có `doi` vẫn chấm đúng qua domain.
+// THANG ĐIỂM 100 — bậc quyết định KHOẢNG điểm, điểm thưởng chỉ phân biệt TRONG khoảng đó.
+// Khoảng cách giữa các bậc (20 điểm) > tổng điểm thưởng tối đa (15 điểm) nên một tài liệu KHÔNG
+// BAO GIỜ vượt bậc: bậc 2 cao nhất = 65+15 = 80 < bậc 1 thấp nhất = 85. Giữ đúng nguyên tắc
+// "tài liệu pháp quy đứng trên bài báo bình duyệt".
+const SOURCE_TIER_BASE = { 1: 85, 2: 65, 3: 45, 4: 20 };
+
+// Nhận {url, title, doi?, hasBody?} — danh sách nào thiếu `doi`/`hasBody` vẫn chấm đúng qua domain
+// (chỉ là không có điểm thưởng để phân biệt thêm — trung thực với dữ liệu đang có).
 function scoreSourceCredibility(s) {
-  // Có mã DOI = bài báo đã đăng ký chính thức trên tạp chí → bằng chứng khoa học bình duyệt.
-  if (s && s.doi) return { tier: 2, label: 'Có DOI — tạp chí bình duyệt' };
   let host = '';
-  try { host = new URL(s && s.url).hostname.replace(/^www\./, ''); }
-  catch { return { tier: 4, label: SOURCE_TIER_LABEL[4], host: '' }; }
-  // Duyệt 2 lượt: KHỚP CHÍNH XÁC trước, khớp tên miền cha sau. Bắt buộc phải theo thứ tự này —
-  // nếu không, `pubchem.ncbi.nlm.nih.gov` (CSDL hóa chất, Mức 3) sẽ ăn theo `ncbi.nlm.nih.gov`
-  // (PubMed, Mức 2) vì cùng tên miền cha, dù bản chất khác hẳn nhau.
-  for (const t of SOURCE_TIER_DOMAINS) {
-    if (t.domains.some((d) => host === d)) return { tier: t.tier, label: SOURCE_TIER_LABEL[t.tier], host };
+  let tier = 4;
+  try { host = new URL(s && s.url).hostname.replace(/^www\./, ''); } catch { host = ''; }
+
+  if (host) {
+    // Duyệt 2 lượt: KHỚP CHÍNH XÁC trước, khớp tên miền cha sau. Bắt buộc theo thứ tự này — nếu
+    // không, `pubchem.ncbi.nlm.nih.gov` (CSDL hóa chất, bậc 3) sẽ ăn theo `ncbi.nlm.nih.gov`
+    // (PubMed, bậc 2) vì cùng tên miền cha, dù bản chất khác hẳn nhau.
+    let matched = false;
+    for (const t of SOURCE_TIER_DOMAINS) {
+      if (t.domains.some((d) => host === d)) { tier = t.tier; matched = true; break; }
+    }
+    if (!matched) for (const t of SOURCE_TIER_DOMAINS) {
+      if (t.domains.some((d) => host.endsWith('.' + d))) { tier = t.tier; matched = true; break; }
+    }
+    if (!matched) for (const r of SOURCE_TLD_RULES) {
+      if (r.test(host)) { tier = r.tier; matched = true; break; }
+    }
   }
-  for (const t of SOURCE_TIER_DOMAINS) {
-    if (t.domains.some((d) => host.endsWith('.' + d))) return { tier: t.tier, label: SOURCE_TIER_LABEL[t.tier], host };
+
+  // Có mã DOI = tài liệu đã đăng ký chính thức trên tạp chí → ít nhất phải là bậc 2, kể cả khi
+  // đang nằm trên domain lạ (vd bản PDF tự lưu trữ của một bài báo đã xuất bản).
+  const doi = s && s.doi ? String(s.doi).trim() : '';
+  if (doi && tier > 2) tier = 2;
+
+  const reasons = [`nền ${SOURCE_TIER_LABEL[tier]} ${SOURCE_TIER_BASE[tier]}`];
+  let points = SOURCE_TIER_BASE[tier];
+
+  // DOI nằm ngay trong URL = mã của CHÍNH bài này (chắc chắn). DOI chỉ tìm thấy trong nội dung thì
+  // kém chắc hơn — rất có thể là DOI của một bài khác được trích dẫn bên trong → cộng ít hơn.
+  if (doi) {
+    if (String(s.url || '').includes(doi)) { points += 10; reasons.push('DOI trong URL +10'); }
+    else { points += 5; reasons.push('DOI trong nội dung +5'); }
   }
-  for (const r of SOURCE_TLD_RULES) {
-    if (r.test(host)) return { tier: r.tier, label: SOURCE_TIER_LABEL[r.tier], host };
-  }
-  return { tier: 4, label: SOURCE_TIER_LABEL[4], host };
+  // Máy chủ đọc được toàn văn (>500 ký tự) = tài liệu truy cập và kiểm chứng được thật.
+  if (s && s.hasBody) { points += 5; reasons.push('đọc được toàn văn +5'); }
+
+  return { tier, points, label: SOURCE_TIER_LABEL[tier], host, reasons };
 }
 
 const SOURCE_TIER_COLOR = {
@@ -550,16 +577,20 @@ const SOURCE_TIER_COLOR = {
 };
 function sourceTierBadgeHtml(score) {
   const c = SOURCE_TIER_COLOR[score.tier] || SOURCE_TIER_COLOR[4];
-  return `<span style="font-size:0.68rem;font-weight:700;padding:2px 8px;border-radius:100px;background:${c.bg};color:${c.fg};white-space:nowrap;">${escHtml(score.label)}</span>`;
+  // Tooltip nêu rõ điểm được cộng từ đâu — minh bạch để người dùng tự kiểm, không phải con số suông.
+  const tip = `Cách tính: ${(score.reasons || []).join(' + ')} = ${score.points}/100`;
+  return `<span title="${escHtml(tip)}" style="font-size:0.68rem;font-weight:700;padding:2px 8px;border-radius:100px;background:${c.bg};color:${c.fg};white-space:nowrap;cursor:help;">${score.points} · ${escHtml(score.label)}</span>`;
 }
 
 // Chấm điểm + sắp xếp uy tín cao lên đầu. Gắn `_score` vào từng phần tử để render dùng lại.
 // Trả về MẢNG MỚI — không sửa thứ tự mảng gốc trong `state` (tránh ảnh hưởng chỗ khác).
+// Sắp theo ĐIỂM giảm dần: vì các bậc không chồng lấn nên thứ tự bậc vẫn được giữ nguyên, đồng
+// thời phân biệt được các tài liệu cùng bậc (trước đây chúng xếp lẫn lộn vì cùng số bậc).
 function sortSourcesByCredibility(list) {
   if (!Array.isArray(list)) return [];
   return list
     .map((s) => Object.assign({}, s, { _score: scoreSourceCredibility(s) }))
-    .sort((a, b) => a._score.tier - b._score.tier);
+    .sort((a, b) => b._score.points - a._score.points);
 }
 
 // Dòng chú thích cho danh sách chỉ có DUY NHẤT 1 nguồn (patent/Vidal/PubChem/dược điển) — gắn
@@ -568,7 +599,7 @@ function singleSourceNoteHtml(sampleUrl, sourceName) {
   const score = scoreSourceCredibility({ url: sampleUrl });
   const c = SOURCE_TIER_COLOR[score.tier] || SOURCE_TIER_COLOR[4];
   return `<div style="font-size:.72rem;color:var(--text-3);margin:-.2rem 0 .6rem">
-    Nguồn: ${escHtml(sourceName)} — <span style="color:${c.fg};font-weight:600">Mức ${score.tier} (${escHtml(score.label)})</span>
+    Nguồn: ${escHtml(sourceName)} — <span style="color:${c.fg};font-weight:600">${score.points}/100 · Mức ${score.tier} (${escHtml(score.label)})</span>
   </div>`;
 }
 
@@ -1955,8 +1986,8 @@ function renderStabilityTab() {
     // Chấm điểm + SẮP XẾP từ uy tín cao xuống thấp — theo yêu cầu người dùng.
     readPapers.forEach((p) => { p._score = scoreSourceCredibility(p); });
     unreadPapers.forEach((p) => { p._score = scoreSourceCredibility(p); });
-    readPapers.sort((a, b) => a._score.tier - b._score.tier);
-    unreadPapers.sort((a, b) => a._score.tier - b._score.tier);
+    readPapers.sort((a, b) => b._score.points - a._score.points);
+    unreadPapers.sort((a, b) => b._score.points - a._score.points);
 
     if (readPapers.length) {
       html += `<div class="mt-2" style="margin-bottom: 20px;">
@@ -3203,7 +3234,16 @@ function pselPatentCardHtml(p, idx) {
         </div>
         <div class="mt-2"><b>Số patent:</b> <span class="mono">${escHtml(p.patentNumber || '')}</span></div>
         ${p.realTitle ? `<div class="mt-1"><b>Tên patent (lấy từ nguồn thật):</b> ${escHtml(p.realTitle)}</div>` : ''}
-        <div class="mt-1"><b>Người nộp:</b> ${p.applicant ? escHtml(p.applicant) : '<i class="text-3">(không xác định được)</i>'}</div>
+        <div class="mt-1"><b>Người nộp:</b> ${p.applicant ? escHtml(p.applicant) : '<i class="text-3">(không xác định được)</i>'}${
+          p.applicantNote ? ` <span class="text-3" style="font-size:.72rem">(${escHtml(p.applicantNote)})</span>` : ''
+        }${
+          // Nêu rõ căn cứ đối chiếu chủ sở hữu — không im lặng để người dùng tưởng đã kiểm chắc.
+          p.ownerMatch === 'same' && p.ownerMatchBy === 'ai'
+            ? ' <span class="text-3" style="font-size:.72rem">(AI đối chiếu tên phiên âm)</span>'
+            : p.ownerMatch === 'unknown'
+              ? '<div class="text-sm mt-1" style="color:#b45309">⚠️ Chưa đối chiếu được chủ sở hữu với hãng phát minh — hãy tự kiểm trước khi dùng.</div>'
+              : ''
+        }</div>
         ${p.filingDate ? `<div class="mt-1"><b>Ngày nộp:</b> ${escHtml(p.filingDate)}</div>` : ''}
         ${p.expiryDate ? `<div class="mt-1"><b>Ngày hết hạn:</b> ${escHtml(p.expiryDate)}</div>` : ''}
         <div class="mt-2" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;">
