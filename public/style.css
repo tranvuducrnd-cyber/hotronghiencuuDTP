@@ -1291,3 +1291,92 @@ select.input-field:invalid { color: var(--text-3); }
 }
 .asst-send:hover:not(:disabled) { opacity: 0.9; }
 .asst-send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ── Lựa chọn sản phẩm: toggle chế độ + form + badge trạng thái patent ────── */
+.psel-mode-toggle { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.psel-mode-btn {
+  border: 1px solid var(--card-border); background: #fff; color: var(--text-2);
+  border-radius: 100px; padding: 0.55rem 1.1rem; font-size: 0.82rem; font-weight: 600;
+  cursor: pointer; transition: all 0.15s;
+}
+.psel-mode-btn:hover { border-color: rgba(37,99,235,0.5); color: var(--blue); }
+.psel-mode-btn.active { background: var(--grad-primary, linear-gradient(90deg,#2563eb,#7c3aed)); color: #fff; border-color: transparent; }
+
+.psel-mode-panel { display: none; }
+.psel-mode-panel.active { display: block; }
+
+.psel-form-row { display: flex; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
+.psel-form-row .input-field { flex: 1; min-width: 220px; }
+
+.psel-status-row { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+.psel-badge {
+  display: inline-block; font-size: 0.78rem; font-weight: 700; padding: 4px 12px;
+  border-radius: 100px; line-height: 1.4;
+}
+.psel-badge-red   { background: rgba(220,38,38,0.1);  color: #dc2626; border: 1px solid rgba(220,38,38,0.3); }
+.psel-badge-green { background: rgba(22,163,74,0.12); color: #15803d; border: 1px solid rgba(22,163,74,0.3); }
+.psel-badge-gray  { background: rgba(100,116,139,0.12); color: #475569; border: 1px solid rgba(100,116,139,0.3); }
+.psel-badge-official { background: rgba(37,99,235,0.12); color: #1d4ed8; border: 1px solid rgba(37,99,235,0.3); }
+.psel-badge-warn  { background: rgba(245,158,11,0.12); color: #b45309; border: 1px solid rgba(245,158,11,0.35); }
+.psel-confidence { font-size: 0.76rem; color: var(--text-3); }
+
+/* ── Danh sách patent hết hạn: thư mục kiểu Pharsight/GreyB ───────────────── */
+.psel-hub { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 1.5rem 1.8rem; }
+.psel-hub-col { display: flex; flex-direction: column; gap: 4px; }
+.psel-hub-group-title {
+  font-size: 0.74rem; font-weight: 700; color: var(--text-3); text-transform: uppercase;
+  letter-spacing: 0.04em; padding-bottom: 6px; margin-bottom: 4px; border-bottom: 1px solid var(--card-border);
+}
+.psel-hub-link { color: var(--blue); text-decoration: none; font-size: 0.86rem; padding: 3px 0; }
+.psel-hub-link:hover { text-decoration: underline; }
+.psel-hub-back {
+  border: 1px solid var(--card-border); background: #fff; color: var(--text-2);
+  border-radius: 8px; padding: 0.45rem 0.9rem; font-size: 0.8rem; cursor: pointer; transition: all 0.15s;
+}
+.psel-hub-back:hover { border-color: rgba(37,99,235,0.5); color: var(--blue); }
+.psel-source-note { font-size: 0.76rem; color: var(--text-3); }
+.psel-source-note a { color: var(--blue); text-decoration: none; }
+.psel-source-note a:hover { text-decoration: underline; }
+
+/* Nút "Tóm tắt" cạnh mỗi link + panel kết quả rộng dưới lưới thư mục */
+.psel-hub-item { display: flex; align-items: baseline; gap: 6px; padding: 3px 0; }
+.psel-hub-item .psel-hub-link { padding: 0; flex: 1; min-width: 0; }
+.psel-sum-btn {
+  flex-shrink: 0; border: 1px solid rgba(37,99,235,0.3); background: rgba(37,99,235,0.06);
+  color: #2563eb; border-radius: 6px; padding: 2px 7px; font-size: 0.68rem; font-weight: 600;
+  cursor: pointer; white-space: nowrap; transition: background 0.15s;
+}
+.psel-sum-btn:hover:not(:disabled) { background: rgba(37,99,235,0.15); }
+.psel-sum-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.psel-summary-panel {
+  margin-top: 1.2rem; background: #f8fafc; border: 1px solid var(--card-border);
+  border-radius: var(--r-md); padding: 1.1rem 1.3rem;
+}
+.psel-summary-title {
+  font-size: 0.92rem; font-weight: 700; color: var(--text-1);
+  display: flex; align-items: baseline; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 0.7rem;
+}
+.psel-summary-src { font-size: 0.76rem; font-weight: 500; color: var(--blue); text-decoration: none; }
+.psel-summary-src:hover { text-decoration: underline; }
+.psel-summary-body { font-size: 0.87rem; line-height: 1.75; color: var(--text-1); }
+.psel-summary-body strong { font-weight: 700; }
+.psel-summary-meta { font-size: 0.74rem; color: var(--text-3); margin-top: 0.8rem; line-height: 1.6; }
+
+/* Bảng danh sách patent đầy đủ (trích từ trang gốc) + ô lọc nhanh */
+.psel-rows-head {
+  display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem;
+  flex-wrap: wrap; margin-top: 1.3rem; margin-bottom: 0.6rem;
+  padding-top: 1rem; border-top: 1px solid var(--card-border);
+}
+.psel-filter {
+  flex: 0 1 280px; min-width: 200px; padding: 0.45rem 0.7rem;
+  border: 1px solid var(--card-border); border-radius: 8px;
+  font-size: 0.82rem; font-family: inherit; color: var(--text-1); background: #fff;
+}
+.psel-filter:focus { outline: none; border-color: rgba(37,99,235,0.5); }
+/* Giới hạn chiều cao để 700+ dòng không đẩy trang dài vô tận */
+.psel-rows-wrap { max-height: 500px; overflow-y: auto; background: #fff; border-radius: var(--r-md); }
+.psel-rows-wrap .data-table th { position: sticky; top: 0; background: #f1f5f9; z-index: 1; }
+.psel-rows-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
+.psel-rows-wrap::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 8px; }

@@ -486,6 +486,92 @@ function assistantBuildContext() {
 }
 
 // Chuyển Markdown gọn → HTML (bỏ dấu * và #, biến thành đậm/tiêu đề/đường kẻ).
+// ── Chấm điểm độ uy tín nguồn tài liệu ────────────────────────────────────────
+// Dùng CHUNG cho mọi danh sách tài liệu/bài báo trong app (độ ổn định, dược lý, tương tác tá
+// dược, double-check...) để sắp xếp nguồn uy tín cao lên trước và gắn nhãn cho người dùng tự
+// đánh giá. Rule-based theo domain — không gọi AI, không gọi mạng, chạy tức thì.
+// Thứ hạng: tài liệu PHÁP QUY (FDA/Dược điển/Patent chính thức — có giá trị pháp lý, dùng để đặt
+// tiêu chuẩn) xếp trên bài báo bình duyệt; rồi tới CSDL chuyên ngành (tổng hợp lại, có độ trễ).
+const SOURCE_TIER_LABEL = {
+  1: 'Pháp quy / Chính thức',
+  2: 'Khoa học bình duyệt',
+  3: 'CSDL chuyên ngành',
+  4: 'Chưa xác định',
+};
+const SOURCE_TIER_DOMAINS = [
+  { tier: 1, domains: [
+    'fda.gov', 'accessdata.fda.gov', 'ema.europa.eu', 'who.int', 'moh.gov.vn', 'tga.gov.au',
+    'hc-sc.gc.ca', 'mhra.gov.uk', 'usp.org', 'edqm.eu', 'pmda.go.jp',
+    'patents.google.com', 'uspto.gov', 'epo.org', 'wipo.int', 'patentscope.wipo.int' ] },
+  { tier: 2, domains: [
+    'doi.org', 'pubmed.ncbi.nlm.nih.gov', 'ncbi.nlm.nih.gov', 'sciencedirect.com', 'springer.com',
+    'link.springer.com', 'wiley.com', 'onlinelibrary.wiley.com', 'tandfonline.com', 'nature.com',
+    'mdpi.com', 'acs.org', 'pubs.acs.org', 'rsc.org', 'pubs.rsc.org', 'sagepub.com',
+    'cambridge.org', 'oup.com', 'frontiersin.org', 'plos.org', 'bmj.com' ] },
+  { tier: 3, domains: [
+    'pubchem.ncbi.nlm.nih.gov', 'ebi.ac.uk', 'drugbank.com', 'drugbank.ca', 'chembl.org',
+    'researchgate.net', 'semanticscholar.org', 'academia.edu', 'core.ac.uk', 'ssrn.com',
+    'vidal.ru', 'drugs.com', 'rxlist.com', 'medlineplus.gov', 'pharsight.greyb.com',
+    'drugpatentwatch.com', 'scholar.google.com' ] },
+];
+// Quy tắc TỔNG QUÁT theo đuôi domain — bắt cả domain lạ chưa kịp liệt kê tay ở trên.
+const SOURCE_TLD_RULES = [
+  { test: (h) => /\.gov(\.[a-z]{2})?$/.test(h) || /\.int$/.test(h), tier: 1 },
+  { test: (h) => /\.edu(\.[a-z]{2})?$/.test(h) || /\.ac\.[a-z]{2}$/.test(h), tier: 2 },
+];
+
+// Nhận {url, title, doi?} — danh sách nào không có `doi` vẫn chấm đúng qua domain.
+function scoreSourceCredibility(s) {
+  // Có mã DOI = bài báo đã đăng ký chính thức trên tạp chí → bằng chứng khoa học bình duyệt.
+  if (s && s.doi) return { tier: 2, label: 'Có DOI — tạp chí bình duyệt' };
+  let host = '';
+  try { host = new URL(s && s.url).hostname.replace(/^www\./, ''); }
+  catch { return { tier: 4, label: SOURCE_TIER_LABEL[4], host: '' }; }
+  // Duyệt 2 lượt: KHỚP CHÍNH XÁC trước, khớp tên miền cha sau. Bắt buộc phải theo thứ tự này —
+  // nếu không, `pubchem.ncbi.nlm.nih.gov` (CSDL hóa chất, Mức 3) sẽ ăn theo `ncbi.nlm.nih.gov`
+  // (PubMed, Mức 2) vì cùng tên miền cha, dù bản chất khác hẳn nhau.
+  for (const t of SOURCE_TIER_DOMAINS) {
+    if (t.domains.some((d) => host === d)) return { tier: t.tier, label: SOURCE_TIER_LABEL[t.tier], host };
+  }
+  for (const t of SOURCE_TIER_DOMAINS) {
+    if (t.domains.some((d) => host.endsWith('.' + d))) return { tier: t.tier, label: SOURCE_TIER_LABEL[t.tier], host };
+  }
+  for (const r of SOURCE_TLD_RULES) {
+    if (r.test(host)) return { tier: r.tier, label: SOURCE_TIER_LABEL[r.tier], host };
+  }
+  return { tier: 4, label: SOURCE_TIER_LABEL[4], host };
+}
+
+const SOURCE_TIER_COLOR = {
+  1: { fg: '#15803d', bg: 'rgba(21,128,61,0.12)' },
+  2: { fg: '#1d4ed8', bg: 'rgba(37,99,235,0.1)' },
+  3: { fg: '#7c3aed', bg: 'rgba(124,58,237,0.1)' },
+  4: { fg: '#94a3b8', bg: 'rgba(148,163,184,0.12)' },
+};
+function sourceTierBadgeHtml(score) {
+  const c = SOURCE_TIER_COLOR[score.tier] || SOURCE_TIER_COLOR[4];
+  return `<span style="font-size:0.68rem;font-weight:700;padding:2px 8px;border-radius:100px;background:${c.bg};color:${c.fg};white-space:nowrap;">${escHtml(score.label)}</span>`;
+}
+
+// Chấm điểm + sắp xếp uy tín cao lên đầu. Gắn `_score` vào từng phần tử để render dùng lại.
+// Trả về MẢNG MỚI — không sửa thứ tự mảng gốc trong `state` (tránh ảnh hưởng chỗ khác).
+function sortSourcesByCredibility(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((s) => Object.assign({}, s, { _score: scoreSourceCredibility(s) }))
+    .sort((a, b) => a._score.tier - b._score.tier);
+}
+
+// Dòng chú thích cho danh sách chỉ có DUY NHẤT 1 nguồn (patent/Vidal/PubChem/dược điển) — gắn
+// badge lặp lại từng dòng ở đó chỉ gây rối vì mọi dòng cùng điểm.
+function singleSourceNoteHtml(sampleUrl, sourceName) {
+  const score = scoreSourceCredibility({ url: sampleUrl });
+  const c = SOURCE_TIER_COLOR[score.tier] || SOURCE_TIER_COLOR[4];
+  return `<div style="font-size:.72rem;color:var(--text-3);margin:-.2rem 0 .6rem">
+    Nguồn: ${escHtml(sourceName)} — <span style="color:${c.fg};font-weight:600">Mức ${score.tier} (${escHtml(score.label)})</span>
+  </div>`;
+}
+
 function mdToHtml(text) {
   let s = escHtml(String(text || ''));
   s = s.replace(/^\s{0,3}#{1,6}\s*(.+?)\s*$/gm, '<strong>$1</strong>'); // tiêu đề # → đậm, bỏ #
@@ -1033,6 +1119,7 @@ async function startSearch() {
   btnSearch.textContent = '🔍 Đang kiểm tra tên hoạt chất...';
   try {
     const validateData = await api('/api/validate-drug', { drugName });
+    if (validateData.sourceIssue) console.warn('[Validate]', validateData.warning);
 
     if (!validateData.valid && validateData.suggestions && validateData.suggestions.length > 0) {
       btnSearch.disabled = false;
@@ -1620,7 +1707,9 @@ function renderDrugTab() {
     }
     physHtml = pickBox('drug', 'drug.physical', 'Tính chất vật lý & dạng thù hình', blkKV(physPairs, physSrc)) + physHtml;
   }
-  setInner('sec-physical', physHtml || '<p class="text-3 text-sm">Không có dữ liệu – hãy tra cứu AI phân tích.</p>');
+  setInner('sec-physical', physHtml
+    ? singleSourceNoteHtml('https://pubchem.ncbi.nlm.nih.gov/', 'PubChem (NIH) + AI xác minh') + physHtml
+    : '<p class="text-3 text-sm">Không có dữ liệu – hãy tra cứu AI phân tích.</p>');
 
   // ── 1.3 Chemical Properties ──────────────────────────────────────────
   const _chemblId  = pc?.chemblId || '';
@@ -1863,6 +1952,12 @@ function renderStabilityTab() {
       else unreadPapers.push(p);
     }
 
+    // Chấm điểm + SẮP XẾP từ uy tín cao xuống thấp — theo yêu cầu người dùng.
+    readPapers.forEach((p) => { p._score = scoreSourceCredibility(p); });
+    unreadPapers.forEach((p) => { p._score = scoreSourceCredibility(p); });
+    readPapers.sort((a, b) => a._score.tier - b._score.tier);
+    unreadPapers.sort((a, b) => a._score.tier - b._score.tier);
+
     if (readPapers.length) {
       html += `<div class="mt-2" style="margin-bottom: 20px;">
         <div class="data-item-label" style="margin-bottom:10px; color: #2563eb;">📄 Các bài báo được AI sử dụng làm Trích dẫn (${readPapers.length})</div>
@@ -1871,6 +1966,7 @@ function renderStabilityTab() {
             <div class="source-link-item" style="margin-bottom: 12px; padding: 10px; background: rgba(15,23,42,0.03); border-radius: 6px; border-left: 3px solid #3b82f6;">
               <div style="font-weight: 600; color: #0f172a; font-size: 0.85rem; margin-bottom: 4px;">
                 <span style="color: #2563eb;">[${i + 1}]</span>
+                ${sourceTierBadgeHtml(p._score)}
                 ${p.url
                   ? `<a href="${escHtml(p.url)}" target="_blank" rel="noopener" style="color: #0f172a; text-decoration: none;">${escHtml(p.title || 'Xem bài báo')}</a>`
                   : `<span>${escHtml(p.title || '')}</span>`
@@ -1898,6 +1994,7 @@ function renderStabilityTab() {
             <div class="source-link-item" style="margin-bottom: 12px; padding: 10px; background: rgba(180,83,9,0.06); border-radius: 6px; border-left: 3px solid #b45309; opacity: 0.8;">
               <div style="font-weight: 600; color: #b45309; font-size: 0.85rem; margin-bottom: 4px;">
                 <span style="color: #b45309;">[${i + 1}]</span>
+                ${sourceTierBadgeHtml(p._score)}
                 ${p.url
                   ? `<a href="${escHtml(p.url)}" target="_blank" rel="noopener" style="color: #b45309; text-decoration: none;">${escHtml(p.title || 'Xem bài báo')}</a>`
                   : `<span>${escHtml(p.title || '')}</span>`
@@ -1924,11 +2021,12 @@ function renderStabilityTab() {
   if (d.searchLinks?.length && !allPapers.length) {
     show('stability-sources-card');
     setInner('sec-stability-sources', `<div class="source-links">${
-      d.searchLinks.slice(0, 10).map((l, i) => `
+      sortSourcesByCredibility(d.searchLinks.slice(0, 10)).map((l, i) => `
         <div class="source-link-item">
           <div class="source-link-num">${i + 1}</div>
           <div class="source-link-text">
             <a href="${escHtml(l.url)}" target="_blank" rel="noopener" class="source-link-title">${escHtml(l.title)}</a>
+            ${sourceTierBadgeHtml(l._score)}
             <span class="source-link-url">${escHtml(l.url)}</span>
           </div>
         </div>`).join('')
@@ -2078,7 +2176,7 @@ function renderSRATab() {
     </div>
   `).join('');
 
-  setInner('sec-sra-products', `<div class="product-list">${productsHtml}</div>`);
+  setInner('sec-sra-products', `${singleSourceNoteHtml('https://www.vidal.ru/', 'Vidal (cơ sở dữ liệu công thức thương mại)')}<div class="product-list">${productsHtml}</div>`);
 
   // Insights
   if (d.suggestedFormulas?.length || d.commonExcipients?.length || d.formulationInsights) {
@@ -2267,6 +2365,7 @@ function renderPatentsTab() {
   if (relatedPatents.length) {
     patentHtml += `
       <div class="data-item-label" style="margin:1.2rem 0 .6rem">📄 ${relatedPatents.length} patent tìm được — bấm "DeepSeek tóm tắt" ở patent bạn cần</div>
+      ${singleSourceNoteHtml('https://patents.google.com/', 'Google Patents')}
       <div class="source-links">
         ${relatedPatents.map((p, i) => {
           const argsJson = escHtml(JSON.stringify([`op${i}`, p.url, p.title || '', p.pdfUrl || '']));
@@ -2366,7 +2465,8 @@ function renderPharmaTab() {
 
   let html = `<div style="margin-bottom:1rem;padding:.75rem 1rem;background:rgba(16,185,129,0.07);border:1px solid rgba(16,185,129,0.2);border-radius:10px;font-size:.82rem;color:var(--text-2)">
     💡 <strong>Tìm thấy ${data.total} monograph</strong> cho <strong>${escHtml(state.drugName)}</strong>. Bấm vào tiêu đề monograph cụ thể dưới đây để AI tự động xây dựng tiêu chuẩn chất lượng 100% theo Dược điển đó.
-  </div>`;
+  </div>
+  ${singleSourceNoteHtml('https://www.usp.org/', 'Dược điển chính thức (USP/BP/EP/JP...)')}`;
 
   for (const form of sortedForms) {
     const entries = grouped[form];
@@ -2596,11 +2696,12 @@ function renderCompatibilityTab() {
   // Khối nguồn tham khảo (chỉ có ở chế độ AI) — link bấm được.
   const sourcesHtml = (isAI && data.sources && data.sources.length)
     ? `<div class="data-item-label" style="margin:1.2rem 0 .6rem">📚 Nguồn tham khảo</div>
-       <div class="source-links">${data.sources.map((s, i) => `
+       <div class="source-links">${sortSourcesByCredibility(data.sources).map((s, i) => `
          <div class="source-link-item">
            <div class="source-link-num">${i + 1}</div>
            <div class="source-link-text">
              <a href="${escHtml(s.url)}" target="_blank" rel="noopener" class="source-link-title">${escHtml(s.title || s.url)}</a>
+             ${sourceTierBadgeHtml(s._score)}
              <span class="source-link-url">${escHtml(s.url)}</span>
            </div>
          </div>`).join('')}</div>`
@@ -2773,11 +2874,12 @@ function renderClinicalTab() {
   if (Array.isArray(d.sources) && d.sources.length) {
     html += `<div class="data-item-label" style="margin:1.2rem 0 .6rem">📚 Nguồn tham khảo</div>
       <div class="source-links">
-        ${d.sources.map((s, i) => `
+        ${sortSourcesByCredibility(d.sources).map((s, i) => `
           <div class="source-link-item">
             <div class="source-link-num">${i + 1}</div>
             <div class="source-link-text">
               <a href="${escHtml(s.url)}" target="_blank" rel="noopener" class="source-link-title">${escHtml(s.title || s.url)}</a>
+              ${sourceTierBadgeHtml(s._score)}
               <span class="source-link-url">${escHtml(s.url)}</span>
             </div>
           </div>`).join('')}
@@ -2831,8 +2933,8 @@ async function doubleCheck(section) {
 
 function renderDoubleCheckBadge(data) {
   const sourcesHtml = (data.sources && data.sources.length)
-    ? `<div class="dc-sources"><div class="dc-sources-label">📚 Nguồn đã đối chiếu (${data.sources.length}):</div>
-       ${data.sources.map((s) => `<a href="${escHtml(s.url)}" target="_blank" rel="noopener">${escHtml(s.title || s.url)}</a>`).join('')}</div>`
+    ? `<div class="dc-sources"><div class="dc-sources-label">📚 Nguồn đã đối chiếu (${data.sources.length}) — xếp theo độ uy tín:</div>
+       ${sortSourcesByCredibility(data.sources).map((s) => `<a href="${escHtml(s.url)}" target="_blank" rel="noopener" title="${escHtml('Mức ' + s._score.tier + ' — ' + s._score.label)}"><span style="color:${SOURCE_TIER_COLOR[s._score.tier].fg};font-weight:700">[${s._score.tier}]</span> ${escHtml(s.title || s.url)}</a>`).join('')}</div>`
     : '';
   const summaryHtml = data.summary ? `<div class="dc-summary">${escHtml(data.summary)}</div>` : '';
 
@@ -2851,6 +2953,389 @@ function renderDoubleCheckBadge(data) {
   }
   // unknown
   return `<div class="dc-out"><span class="dc-badge dc-unknown">◐ Chưa đủ nguồn để xác minh chắc chắn</span>${summaryHtml}${sourcesHtml}</div>`;
+}
+
+// ── Lựa chọn sản phẩm nghiên cứu: Tra cứu Patent hết hạn ────────────────────────
+let _pselInited = false;
+
+function loadProductSelection() {
+  if (_pselInited) return;
+  _pselInited = true;
+  // Điền danh sách năm cho chế độ "Duyệt theo năm": năm hiện tại -> +5.
+  const yearSel = document.getElementById('psel-year');
+  if (yearSel) {
+    const nowYear = new Date().getFullYear();
+    const opts = [];
+    for (let y = nowYear; y <= nowYear + 5; y++) opts.push(`<option value="${y}">${y}</option>`);
+    yearSel.innerHTML = opts.join('');
+  }
+}
+
+function pselSwitchMode(mode) {
+  document.querySelectorAll('.psel-mode-panel').forEach((p) => p.classList.remove('active'));
+  document.querySelectorAll('.psel-mode-btn').forEach((b) => b.classList.remove('active'));
+  document.getElementById('psel-mode-' + mode).classList.add('active');
+  document.getElementById('psel-mode-' + mode + '-btn').classList.add('active');
+  if (mode === 'browse') pselLoadHub();
+}
+
+// ── Danh sách patent hết hạn: thư mục kiểu Pharsight/GreyB ──────────────────────
+let _pselHubLoaded = false;
+
+async function pselAuthedGet(endpoint, tries = 3, delayMs = 3000, onRetry) {
+  const headers = {};
+  if (supabase) {
+    const { data: { session } } = await supabase.auth.getSession();
+    if (session?.access_token) headers['Authorization'] = `Bearer ${session.access_token}`;
+  }
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(endpoint, { headers });
+      const raw = await res.text();
+      let data = {};
+      if (raw) { try { data = JSON.parse(raw); } catch (e) { throw new Error(`Dữ liệu không hợp lệ (HTTP ${res.status})`); } }
+      if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    } catch (e) {
+      lastErr = e;
+      if (i < tries - 1) { if (onRetry) onRetry(i + 1, tries - 1); await new Promise((r) => setTimeout(r, delayMs)); }
+    }
+  }
+  throw lastErr;
+}
+
+// GreyB chỉ được dùng làm THƯ MỤC LINK ra trang gốc (mở tab mới) — KHÔNG cào/hiển thị dữ liệu
+// của họ trong app, vì dữ liệu thật của GreyB nằm trong payload JS nội bộ (không phải bảng
+// HTML thường); cào/suy luận dễ lấy nhầm placeholder, còn chạy JS của họ trên server là rủi
+// ro bảo mật không đáng đánh đổi. Riêng thẻ "FDA Orange Book" mở khối chọn năm có sẵn trong app.
+async function pselLoadHub() {
+  if (_pselHubLoaded) return;
+  const hub = document.getElementById('psel-hub');
+  try {
+    const data = await pselAuthedGet('/api/product-selection/greyb-catalog');
+    const groups = data.catalog || [];
+    hub.innerHTML = `
+      <div class="psel-hub">
+        ${groups.map((g) => `
+          <div class="psel-hub-col">
+            <div class="psel-hub-group-title">${escHtml(g.group)}</div>
+            ${g.items.map((it, i) => {
+              // Mục duy nhất không có url là "FDA Orange Book" (server tự thêm, không đến từ GreyB).
+              if (!it.url) return `<a href="#" class="psel-hub-link" onclick="pselOpenList('fda-orange-book'); return false;">${escHtml(it.label)}</a>`;
+              // Truyền tham số an toàn qua onclick (tránh vỡ chuỗi khi nhãn/URL có dấu nháy).
+              const args = escHtml(JSON.stringify([it.url, it.label]));
+              return `<div class="psel-hub-item">
+                <a href="${escHtml(it.url)}" class="psel-hub-link" target="_blank" rel="noopener">${escHtml(it.label)} ↗</a>
+                <button class="psel-sum-btn" onclick="pselSummarizeLink.apply(this, ${args})">📄 Tóm tắt</button>
+              </div>`;
+            }).join('')}
+          </div>`).join('')}
+      </div>
+      <div id="psel-summary-panel"></div>
+      <div class="psel-source-note mt-2">Các danh sách trên dẫn sang <a href="https://pharsight.greyb.com/" target="_blank" rel="noopener">Pharsight (GreyB)</a> — mở ở tab mới, hoặc bấm "📄 Tóm tắt" để AI đọc & tóm tắt ngay tại đây. Riêng "FDA Orange Book" là dữ liệu chính thức, xem trực tiếp trong app.${data.fetchedAt ? ` <span title="Thư mục tự cập nhật mỗi ngày">(cập nhật lần cuối: ${new Date(data.fetchedAt).toLocaleString('vi-VN')})</span>` : ''}</div>`;
+    _pselHubLoaded = true;
+  } catch (e) {
+    hub.innerHTML = `<div class="insight-box amber"><div class="insight-label amber">⚠️ Lỗi tải danh mục</div>${escHtml(e.message)}</div>`;
+  }
+}
+
+// Danh sách patent đầy đủ của trang đang xem (server trích bằng code, không qua AI).
+let _pselRows = [];
+
+// Chỉ hiện các cột thực sự có dữ liệu — trang công ty (vd Lupin) không có cột Thuốc/Công ty
+// nhưng lại có cột Tình trạng, nên bảng phải tự thích ứng thay vì cố định 5 cột.
+const PSEL_COLS = [
+  { key: 'drug', label: 'Thuốc' },
+  { key: 'patent', label: 'Số patent', mono: true },
+  { key: 'company', label: 'Công ty' },
+  { key: 'title', label: 'Tên sáng chế' },
+  { key: 'expiry', label: 'Ngày hết hạn' },
+  { key: 'status', label: 'Tình trạng' },
+];
+let _pselActiveCols = [];
+
+function pselComputeCols(rows) {
+  return PSEL_COLS.filter((c) => rows.some((r) => (r[c.key] || '').trim()));
+}
+
+function pselRowsToHtml(rows) {
+  return rows.map((r) => `<tr>${_pselActiveCols.map((c) =>
+    `<td${c.mono ? ' class="mono"' : ''}>${escHtml(r[c.key] || '')}</td>`).join('')}</tr>`).join('');
+}
+
+function pselFilterRows(q) {
+  const body = document.getElementById('psel-rows-body');
+  if (!body) return;
+  const kw = (q || '').trim().toLowerCase();
+  const filtered = kw
+    ? _pselRows.filter((r) => `${r.drug} ${r.patent} ${r.company} ${r.title} ${r.expiry}`.toLowerCase().includes(kw))
+    : _pselRows;
+  body.innerHTML = filtered.length
+    ? pselRowsToHtml(filtered)
+    : `<tr><td colspan="${_pselActiveCols.length || 5}" style="text-align:center;color:var(--text-3);padding:1rem">Không có dòng nào khớp.</td></tr>`;
+}
+
+// Bấm "📄 Tóm tắt": server tải toàn bộ trang GreyB, cho AI đọc rồi trả tóm tắt tiếng Việt.
+// Kết quả hiện ở panel RỘNG dưới lưới thư mục (các cột chỉ ~230-300px, hiện inline sẽ quá hẹp).
+async function pselSummarizeLink(url, label) {
+  const panel = document.getElementById('psel-summary-panel');
+  if (!panel) return;
+  // `this` là nút vừa bấm (onclick dùng .apply(this, ...)).
+  const btn = (this && this.classList && this.classList.contains('psel-sum-btn')) ? this : null;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ Đang đọc...'; }
+  const restoreBtn = () => { if (btn) { btn.disabled = false; btn.textContent = '📄 Tóm tắt'; } };
+
+  panel.innerHTML = `<div class="psel-summary-panel">
+    <div class="psel-summary-title">⏳ AI đang đọc toàn bộ trang: ${escHtml(label)}</div>
+    <div class="psel-summary-meta">Đang phân tích chi tiết — trang nhỏ ~10-20 giây, trang rất lớn có thể tới ~1 phút. Vui lòng đợi...</div>
+  </div>`;
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+  try {
+    const data = await api('/api/product-selection/summarize-link', { url, openaiKey: state.openaiKey || undefined });
+    _pselRows = Array.isArray(data.patentRows) ? data.patentRows : [];
+    _pselActiveCols = pselComputeCols(_pselRows);
+    const drugCount = new Set(_pselRows.map((r) => r.drug).filter(Boolean)).size;
+
+    // Bảng danh sách ĐẦY ĐỦ được trích thẳng từ trang gốc bằng code (không qua AI) → không thể bịa.
+    const rowsHtml = _pselRows.length ? `
+      <div class="psel-rows-head">
+        <div>
+          <div class="psel-summary-title" style="margin:0">📋 Danh sách chi tiết đầy đủ</div>
+          <div class="psel-summary-meta" style="margin-top:2px">${_pselRows.length.toLocaleString('vi-VN')} dòng patent${drugCount ? ` · ${drugCount.toLocaleString('vi-VN')} thuốc` : ''} — trích trực tiếp từ trang gốc, không qua AI</div>
+        </div>
+        <input type="text" class="psel-filter" id="psel-filter" placeholder="Lọc theo thuốc, công ty, số patent..." oninput="pselFilterRows(this.value)">
+      </div>
+      <div class="data-table-wrap psel-rows-wrap">
+        <table class="data-table">
+          <thead><tr>${_pselActiveCols.map((c) => `<th>${escHtml(c.label)}</th>`).join('')}</tr></thead>
+          <tbody id="psel-rows-body">${pselRowsToHtml(_pselRows)}</tbody>
+        </table>
+      </div>` : '';
+
+    panel.innerHTML = `<div class="psel-summary-panel">
+      <div class="psel-summary-title">📄 ${escHtml(label)}
+        <a href="${escHtml(url)}" target="_blank" rel="noopener" class="psel-summary-src">↗ mở trang gốc</a>
+      </div>
+      <div class="psel-summary-body">${mdToHtml(data.summary || '')}</div>
+      ${rowsHtml}
+      <div class="psel-summary-meta">Đã đọc toàn bộ ${(data.totalChars || 0).toLocaleString('vi-VN')} ký tự${data.cached ? ' · lấy từ bộ nhớ đệm' : ''} · Nguồn: Pharsight (GreyB) — phần phân tích do AI tạo, hãy đối chiếu trang gốc khi dùng cho quyết định quan trọng.${_pselRows.length ? '' : ' Trang này không có bảng patent để trích.'}</div>
+    </div>`;
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    panel.innerHTML = `<div class="insight-box amber"><div class="insight-label amber">⚠️ Không tóm tắt được</div>${escHtml(e.message)} — bạn có thể <a href="${escHtml(url)}" target="_blank" rel="noopener">mở trang gốc</a>.</div>`;
+  } finally {
+    restoreBtn();
+  }
+}
+
+function pselOpenList(key) {
+  if (key !== 'fda-orange-book') return;
+  document.getElementById('psel-hub').style.display = 'none';
+  const listView = document.getElementById('psel-list-view');
+  listView.hidden = false;
+  document.getElementById('psel-orangebook-controls').hidden = false;
+  document.getElementById('sec-psel-browse').innerHTML = `<div class="empty-state" style="padding:2rem"><div class="empty-state-icon">📅</div><div class="empty-state-sub">Chọn năm để xem các thuốc có patent/độc quyền hết hạn trong năm đó (nguồn: FDA Orange Book).</div></div>`;
+}
+
+function pselBackToHub() {
+  document.getElementById('psel-list-view').hidden = true;
+  document.getElementById('psel-hub').style.display = '';
+}
+
+const PSEL_STATUS_BADGE = {
+  'còn hạn': 'psel-badge-red',
+  'hết hạn': 'psel-badge-green',
+  'phạm vi công cộng': 'psel-badge-gray',
+  'không xác định': 'psel-badge-gray',
+  'không rõ': 'psel-badge-gray',
+};
+const PSEL_SOURCE_LABEL = {
+  'orange-book': '🏛️ FDA Orange Book', 'serper': 'Google Search', 'google-patents': 'Google Patents', 'ai': 'AI gợi ý',
+};
+
+// Hiện các patent AI đưa ra nhưng KHÔNG qua được bước đối chiếu Google Patents (đã bị loại).
+// Minh bạch với người dùng thay vì im lặng giấu đi.
+function pselRejectedHtml(rejected) {
+  if (!Array.isArray(rejected) || !rejected.length) return '';
+  return `<div class="insight-box amber mt-2">
+    <div class="insight-label amber">⚠️ Đã loại ${rejected.length} patent do không khớp khi đối chiếu Google Patents</div>
+    ${rejected.map((r) => `<div class="text-sm mt-1">
+      <span class="mono">${escHtml(r.patentNumber || '')}</span> — ${escHtml(r.reason || '')}
+      ${r.realTitle ? `<br><span class="text-3">Nội dung thật: ${escHtml(r.realTitle)}</span>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+// Hiện các patent ĐÃ XÁC MINH LÀ THẬT nhưng applicant KHÔNG khớp bất kỳ dòng hãng gốc nào (vd
+// patent hợp pháp của GSK/hãng generic khác, không phải nhà sản xuất biệt dược gốc) — theo yêu cầu
+// người dùng, những patent này bị LOẠI khỏi danh sách chính, nhưng vẫn liệt kê gọn ở đây để minh
+// bạch (không âm thầm biến mất).
+function pselNonOriginatorHtml(items) {
+  if (!Array.isArray(items) || !items.length) return '';
+  return `<div class="insight-box mt-2">
+    <div class="insight-label">ℹ️ Đã ẩn ${items.length} patent hợp lệ nhưng KHÔNG thuộc nhà sản xuất biệt dược gốc</div>
+    ${items.map((r) => `<div class="text-sm mt-1">
+      <span class="mono">${escHtml(r.patentNumber || '')}</span>${r.applicant ? ` — của ${escHtml(r.applicant)}` : ''}
+      ${r.realTitle ? `<br><span class="text-3">${escHtml(r.realTitle)}</span>` : ''}
+    </div>`).join('')}
+  </div>`;
+}
+
+// 1 thẻ patent — dùng chung cho patent đã xác minh (verified) và patent chưa xác minh (unverified,
+// vd Google Patents đang chặn tạm/503) để không lặp code; chỉ khác badge trạng thái xác minh.
+function pselPatentCardHtml(p, idx) {
+  const src = p.source ? `<span class="psel-badge psel-badge-gray">Nguồn: ${escHtml(PSEL_SOURCE_LABEL[p.source] || p.source)}</span>` : '';
+  const verifyBadge = p.source === 'orange-book'
+    ? '<span class="psel-badge psel-badge-official">🏛️ FDA Orange Book (chính thức)</span>'
+    : p.verifyStatus === 'unverified'
+      ? `<span class="psel-badge psel-badge-warn" title="${escHtml(p.unverifiedReason || '')}">⚠️ Chưa xác minh được</span>`
+      : '<span class="psel-badge psel-badge-green">✓ Đã đối chiếu Google Patents</span>';
+  const argsJson = escHtml(JSON.stringify([idx, p.patentNumber, p.sourceUrl, p.realTitle || p.patentNumber, p.pdfUrl || null]));
+  return `
+      <div class="section-card" style="margin:0 0 0.8rem;">
+        <div class="psel-status-row">
+          ${verifyBadge}
+          ${p.status ? `<span class="psel-badge ${PSEL_STATUS_BADGE[p.status] || 'psel-badge-gray'}">${escHtml(p.status)}</span>` : ''}
+          ${p.patentType ? `<span class="psel-badge psel-badge-gray">${escHtml(p.patentType)}</span>` : ''}
+          ${src}
+        </div>
+        <div class="mt-2"><b>Số patent:</b> <span class="mono">${escHtml(p.patentNumber || '')}</span></div>
+        ${p.realTitle ? `<div class="mt-1"><b>Tên patent (lấy từ nguồn thật):</b> ${escHtml(p.realTitle)}</div>` : ''}
+        <div class="mt-1"><b>Người nộp:</b> ${p.applicant ? escHtml(p.applicant) : '<i class="text-3">(không xác định được)</i>'}</div>
+        ${p.filingDate ? `<div class="mt-1"><b>Ngày nộp:</b> ${escHtml(p.filingDate)}</div>` : ''}
+        ${p.expiryDate ? `<div class="mt-1"><b>Ngày hết hạn:</b> ${escHtml(p.expiryDate)}</div>` : ''}
+        <div class="mt-2" style="display:flex;gap:1rem;flex-wrap:wrap;align-items:center;">
+          ${p.sourceUrl ? `<a href="${escHtml(p.sourceUrl)}" target="_blank" rel="noopener">🔗 Nguồn</a>` : ''}
+          <button id="psel-patsum-btn-${idx}" class="tag tag-blue" style="font-size:.7rem; cursor:pointer; border:none;"
+            onclick="pselSummarizePatentClick.apply(null, ${argsJson})">🔎 Đọc & tóm tắt patent này</button>
+        </div>
+        <div id="psel-patsum-result-${idx}" style="margin-top:8px;"></div>
+      </div>`;
+}
+
+let _pselPatentIdx = 0;
+
+async function pselFindOriginator() {
+  const drugName = document.getElementById('psel-drug-name').value.trim();
+  const dosageForm = document.getElementById('psel-dosage-form').value.trim();
+  const out = document.getElementById('sec-psel-originator');
+  if (!drugName) { alert('Nhập tên hoạt chất trước đã.'); return; }
+  out.innerHTML = `<div class="skeleton" style="height:160px;border-radius:12px;"></div>`;
+  try {
+    const d = await apiWithRetry('/api/product-selection/originator-patent', { drugName, dosageForm, openaiKey: state.openaiKey || undefined }, 3, 3000,
+      (n, max) => { out.innerHTML = `<div class="empty-state" style="padding:2rem"><div class="empty-state-sub">⏳ Đang tra cứu nhiều nguồn (Google Search, FDA Orange Book, Google Patents, AI)... (thử lại lần ${n}/${max})</div></div>`; });
+
+    // Có thể có NHIỀU dòng hãng gốc hợp pháp song song (vd thuốc cũ bán ở nhiều khu vực với thương
+    // hiệu khác nhau, hoặc công ty đã đổi chủ qua M&A) — không ép về 1 cái tên duy nhất.
+    const originators = Array.isArray(d.originators) ? d.originators : [];
+    const originatorsHtml = originators.length
+      ? originators.map((o) => `<div>${escHtml(o.company || 'không xác định')}${o.brand ? ` — <i>${escHtml(o.brand)}</i>` : ''}${o.region ? ` <span class="text-3 text-sm">(${escHtml(o.region)})</span>` : ''}</div>`).join('')
+      // Rỗng có thể là do AI thật sự không xác định được, HOẶC 1 lượt phân loại bị lỗi thoáng qua
+      // (server đã tự thử lại 1 lần) — không khẳng định "không có", chỉ nói chưa xác định được.
+      : '<div class="text-3">Chưa xác định được — có thể do lượt tra cứu này gặp trục trặc tạm thời khi phân loại. Danh sách patent bên dưới vẫn dùng được bình thường; thử tra cứu lại nếu cần biết hãng phát minh.</div>';
+    const header = `
+      <div class="mt-1" style="margin-bottom:1rem;">
+        <b>Hãng phát minh (originator)${originators.length > 1 ? ' — nhiều dòng hợp pháp' : ''}:</b>
+        ${originatorsHtml}
+        ${d.dosageForm ? `<div class="text-2 text-sm mt-1">Dạng bào chế đang xét: ${escHtml(d.dosageForm)}</div>` : ''}
+      </div>`;
+
+    const patents = Array.isArray(d.formulationPatents) ? d.formulationPatents : [];
+    const unverified = Array.isArray(d.unverifiedPatents) ? d.unverifiedPatents : [];
+    _pselPatentIdx = 0;
+
+    if (!patents.length && !unverified.length) {
+      out.innerHTML = `
+        <div class="section-card" style="margin:0">
+          ${header}
+          <div class="psel-status-row"><span class="psel-badge psel-badge-gray">Không tìm thấy patent dạng bào chế đáng tin</span></div>
+          <div class="mt-2 text-2">${escHtml(d.overallNote || 'Không xác định được patent dạng bào chế rõ ràng cho hoạt chất này.')}</div>
+          ${pselRejectedHtml(d.rejectedPatents)}
+          ${pselNonOriginatorHtml(d.nonOriginatorPatents)}
+          <div class="mt-2"><a href="${escHtml(d.googlePatentsUrl)}" target="_blank" rel="noopener">🔗 Tự tra trên Google Patents</a></div>
+        </div>`;
+      return;
+    }
+
+    const cards = patents.map((p) => pselPatentCardHtml(p, _pselPatentIdx++)).join('');
+    const unverifiedCards = unverified.length ? `
+      <div class="text-sm text-3 mt-2" style="font-weight:600;">⚠️ Các patent sau CHƯA xác minh được (Google Patents đang chặn tạm hoặc quá thời gian) — vẫn hiển thị để bạn tự kiểm chứng, không âm thầm loại bỏ:</div>
+      ${unverified.map((p) => pselPatentCardHtml(p, _pselPatentIdx++)).join('')}` : '';
+
+    out.innerHTML = `
+      ${header}
+      ${cards}
+      ${unverifiedCards}
+      ${pselRejectedHtml(d.rejectedPatents)}
+      ${pselNonOriginatorHtml(d.nonOriginatorPatents)}
+      ${d.overallNote ? `<div class="text-2 text-sm mt-1">${escHtml(d.overallNote)}</div>` : ''}
+      <div class="mt-2"><a href="${escHtml(d.googlePatentsUrl)}" target="_blank" rel="noopener">🔗 Xem thêm trên Google Patents</a></div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="insight-box amber"><div class="insight-label amber">⚠️ Lỗi</div>${escHtml(e.message)}</div>`;
+  }
+}
+
+// Đọc & tóm tắt toàn văn 1 patent — TÁI DÙNG route/renderer sẵn có của tab "Patent thuốc gốc"
+// (/api/summarize-patent + patentCardHtml), chỉ khác là lấy hoạt chất/dạng bào chế từ Ô NHẬP CỦA
+// MODULE NÀY thay vì state.drugName/dosageForm (vì người dùng có thể tra 1 hoạt chất khác ở đây).
+async function pselSummarizePatentClick(idx, patentNumber, url, title, pdfUrl) {
+  const btn = document.getElementById(`psel-patsum-btn-${idx}`);
+  const resultEl = document.getElementById(`psel-patsum-result-${idx}`);
+  if (!resultEl) return;
+  if (btn) { btn.disabled = true; btn.textContent = '⏳ DeepSeek đang đọc patent...'; }
+  resultEl.innerHTML = `<div class="skeleton" style="height:60px;border-radius:8px;"></div>`;
+  try {
+    const drugName = document.getElementById('psel-drug-name').value.trim();
+    const dosageForm = document.getElementById('psel-dosage-form').value.trim();
+    const data = await api('/api/summarize-patent', {
+      url, title, pdfUrl, drugName, dosageForm, openaiKey: state.openaiKey,
+    });
+    resultEl.innerHTML = patentCardHtml(data, null); // pid=null: không gắn vào Protocol của tab tra cứu chính
+    if (btn) btn.style.display = 'none';
+  } catch (e) {
+    resultEl.innerHTML = `<div style="font-size:.75rem; color:var(--red);">Lỗi: ${escHtml(e.message)}</div>`;
+    if (btn) { btn.disabled = false; btn.textContent = '🔎 Đọc & tóm tắt patent này'; }
+  }
+}
+
+async function pselBrowse() {
+  const year = document.getElementById('psel-year').value;
+  const out = document.getElementById('sec-psel-browse');
+  out.innerHTML = `<div class="skeleton" style="height:160px;border-radius:12px;"></div>`;
+  try {
+    const headers = {};
+    if (supabase) {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.access_token) headers['Authorization'] = `Bearer ${session.access_token}`;
+    }
+    const res = await fetch('/api/product-selection/expiry-browse?year=' + encodeURIComponent(year), { headers });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    const rows = data.items || [];
+    if (!rows.length) {
+      out.innerHTML = `<div class="empty-state" style="padding:2rem"><div class="empty-state-sub">Không tìm thấy thuốc nào hết hạn năm ${escHtml(year)}.</div></div>`;
+      return;
+    }
+    out.innerHTML = `
+      <div class="data-table-wrap">
+        <table class="data-table">
+          <thead><tr><th>Thuốc</th><th>Loại</th><th>Mã</th><th>Ngày hết hạn</th><th>Applicant</th><th>Nguồn</th></tr></thead>
+          <tbody>${rows.map((r) => `
+            <tr>
+              <td>${escHtml(r.drug || '')}</td>
+              <td>${escHtml(r.kind || '')}</td>
+              <td>${escHtml(r.code || '')}</td>
+              <td>${escHtml(r.expireDate || '')}</td>
+              <td>${escHtml(r.applicant || '')}</td>
+              <td>${r.sourceUrl ? `<a href="${escHtml(r.sourceUrl)}" target="_blank" rel="noopener">🔗</a>` : ''}</td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="insight-box amber"><div class="insight-label amber">⚠️ Lỗi</div>${escHtml(e.message)}</div>`;
+  }
 }
 
 // ── History Tab ───────────────────────────────────────────────────────────────

@@ -51,6 +51,10 @@
         <span class="sidebar-nav-icon">🕘</span>
         <span class="sidebar-nav-label">Lịch sử</span>
       </button>
+      <button class="sidebar-nav-btn" id="sidebar-psel-btn" onclick="switchPage('page-product-selection', this); loadProductSelection();" title="Lựa chọn sản phẩm">
+        <span class="sidebar-nav-icon">🎯</span>
+        <span class="sidebar-nav-label">Lựa chọn sản phẩm</span>
+      </button>
       <button class="sidebar-nav-btn" id="sidebar-admin-btn" onclick="switchPage('page-admin', this); loadAdminTab();" title="Quản trị" style="display:none">
         <span class="sidebar-nav-icon">🛡️</span>
         <span class="sidebar-nav-label">Quản trị</span>
@@ -533,6 +537,67 @@
           </div>
         </div>
       </div><!-- /page-history -->
+
+      <!-- ══ Page: Lựa chọn sản phẩm nghiên cứu ═══════════════════════════ -->
+      <div id="page-product-selection" class="page-panel">
+        <div class="section-card">
+          <div class="section-header">
+            <div class="section-icon icon-blue">🎯</div>
+            <div class="section-title">Lựa chọn sản phẩm nghiên cứu</div>
+            <div class="section-subtitle">Tìm patent dạng bào chế & tình trạng bảo hộ để chọn hướng nghiên cứu generic</div>
+          </div>
+          <div class="section-body">
+
+            <!-- Toggle 2 chế độ -->
+            <div class="psel-mode-toggle">
+              <button class="psel-mode-btn active" id="psel-mode-originator-btn" onclick="pselSwitchMode('originator')">🔎 Tìm patent dạng bào chế của hãng phát minh</button>
+              <button class="psel-mode-btn" id="psel-mode-browse-btn" onclick="pselSwitchMode('browse')">📚 Danh sách patent hết hạn</button>
+            </div>
+
+            <!-- Chế độ 1: Tìm patent dạng bào chế theo tên + dạng bào chế -->
+            <div id="psel-mode-originator" class="psel-mode-panel active">
+              <div class="psel-form-row">
+                <input type="text" id="psel-drug-name" class="input-field" placeholder="Tên hoạt chất (vd: dapagliflozin, apixaban...)">
+                <input type="text" id="psel-dosage-form" class="input-field" placeholder="Dạng bào chế (vd: viên nén, viên nang...)" style="max-width:260px">
+                <button class="btn-search" onclick="pselFindOriginator()">🔎 Tra cứu</button>
+              </div>
+              <div id="sec-psel-originator">
+                <div class="empty-state" style="padding:2rem">
+                  <div class="empty-state-icon">🎯</div>
+                  <div class="empty-state-sub">Nhập tên hoạt chất (và dạng bào chế nếu có) để tìm patent DẠNG BÀO CHẾ (công thức, dạng tinh thể, bao phim, giải phóng kiểm soát...) của nhà sản xuất thuốc gốc (originator).</div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Chế độ 2: Danh sách patent hết hạn (thư mục kiểu Pharsight/GreyB) -->
+            <div id="psel-mode-browse" class="psel-mode-panel">
+              <!-- Thư mục các danh sách -->
+              <div id="psel-hub">
+                <div class="skeleton" style="height:160px;border-radius:12px;"></div>
+              </div>
+
+              <!-- Xem 1 danh sách đã chọn -->
+              <div id="psel-list-view" hidden>
+                <button class="psel-hub-back" onclick="pselBackToHub()">← Quay lại danh mục</button>
+
+                <!-- Chỉ hiện khi mở thẻ "FDA Orange Book" -->
+                <div id="psel-orangebook-controls" hidden class="psel-form-row" style="margin-top:0.8rem;">
+                  <select id="psel-year" class="input-field" style="max-width:220px"></select>
+                  <button class="btn-search" onclick="pselBrowse()">📅 Tra cứu</button>
+                </div>
+
+                <div id="sec-psel-browse" style="margin-top:0.8rem;">
+                  <div class="empty-state" style="padding:2rem">
+                    <div class="empty-state-icon">📅</div>
+                    <div class="empty-state-sub">Chọn năm để xem các thuốc có patent/độc quyền hết hạn trong năm đó (nguồn: FDA Orange Book).</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div><!-- /page-product-selection -->
 
       <!-- ══ Page: Quản trị ═══════════════════════════════════════════════ -->
       <div id="page-admin" class="page-panel">

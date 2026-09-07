@@ -403,6 +403,14 @@ async function callOpenAI(apiKey, messages, model = 'openai/gpt-5-nano', retries
           timeout: 90000,
         }
       );
+      // OpenRouter đôi khi trả HTTP 200 nhưng KHÔNG có "choices" — thay vào đó là
+      // {id, error:{message,code}} (vd nhà cung cấp model bị timeout phía sau). Nếu đọc thẳng
+      // res.data.choices[0] sẽ crash "Cannot read properties of undefined" thay vì tự thử lại
+      // như các lỗi HTTP khác — coi trường hợp này là lỗi cần retry giống mọi lỗi khác.
+      if (!res.data || !Array.isArray(res.data.choices) || !res.data.choices[0]) {
+        const upstreamMsg = res.data?.error?.message || 'Phản hồi không có "choices"';
+        throw new Error(`OpenRouter: ${upstreamMsg}`);
+      }
       return res.data.choices[0].message.content;
     } catch (e) {
       const is429 = e.response && e.response.status === 429;
@@ -607,6 +615,14 @@ app.get('/api/image/:chemblId', async (req, res) => {
 
 // ── Route: Validate Drug Name ─────────────────────────────────────────────────
 
+// NCBI (PubChem) thỉnh thoảng CHẶN TẠM một IP gọi quá dồn dập — nhưng vẫn trả HTTP 200 kèm
+// trang HTML "WWW Error Blocked Diagnostic" thay vì JSON thật. axios không parse được JSON từ
+// HTML nên để nguyên `.data` dạng CHUỖI (không throw) — nếu code cũ không kiểm tra, request này
+// trông như "thành công" nhưng thực ra là dữ liệu rác, dễ bị hiểu nhầm thành "không tìm thấy".
+function isRealJsonResponse(axiosRes) {
+  return axiosRes && axiosRes.data !== null && typeof axiosRes.data === 'object';
+}
+
 app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
   const { drugName } = req.body;
   if (!drugName) return res.status(400).json({ valid: false, error: 'Thiếu tên hoạt chất' });
@@ -616,29 +632,64 @@ app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
     const [exactRes, autoRes, chemblRes] = await Promise.allSettled([
       axios.get(`https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(drugName)}/cids/JSON`, { timeout: 6000 }),
       axios.get(`https://pubchem.ncbi.nlm.nih.gov/rest/autocomplete/compound/${encodeURIComponent(drugName)}/JSON`, { timeout: 6000, params: { limit: 8 } }),
-      axios.get(`https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=${encodeURIComponent(drugName)}&limit=5`, { timeout: 6000, headers: { Accept: 'application/json' } }),
+      axios.get(`https://www.ebi.ac.uk/chembl/api/data/molecule/search.json?q=${encodeURIComponent(drugName)}&limit=10`, { timeout: 6000, headers: { Accept: 'application/json' } }),
     ]);
 
-    if (exactRes.status === 'fulfilled' && exactRes.value.data?.IdentifierList?.CID?.length > 0) {
+    const exactOk = exactRes.status === 'fulfilled' && isRealJsonResponse(exactRes.value);
+    const autoOk = autoRes.status === 'fulfilled' && isRealJsonResponse(autoRes.value);
+    const chemblOk = chemblRes.status === 'fulfilled' && isRealJsonResponse(chemblRes.value);
+    const pubchemBlocked = !exactOk && !autoOk && (exactRes.status === 'fulfilled' || autoRes.status === 'fulfilled');
+
+    if (exactOk && exactRes.value.data?.IdentifierList?.CID?.length > 0) {
       return res.json({ valid: true, cid: exactRes.value.data.IdentifierList.CID[0] });
     }
 
-    const suggestions = [];
-    if (autoRes.status === 'fulfilled') {
-      const items = autoRes.value.data?.dictionary_terms?.compound || [];
-      suggestions.push(...items);
-    } else {
-      console.error('[Validate] Autocomplete error:', autoRes.reason?.message);
+    // PubChem là nguồn nhận diện tên tốt nhất, nhưng khi nó không dùng được (bị chặn/lỗi) thì
+    // ChEMBL vẫn xác nhận được: nếu tên người dùng gõ TRÙNG KHỚP CHÍNH XÁC với pref_name hoặc
+    // một tên đồng nghĩa của phân tử thì coi là hợp lệ, không hỏi lại.
+    // Vd "paracetamol" khớp đồng nghĩa của CHEMBL112 (pref_name "ACETAMINOPHEN") — trước đây bị
+    // đẩy xuống danh sách "gợi ý" và hiện hộp thoại "không tìm thấy" dù thuốc rõ ràng có thật.
+    // ĐÃ KIỂM: gõ sai ("paracetmol", "amoxiciline") KHÔNG khớp chính xác → vẫn hiện hộp thoại
+    // gợi ý như cũ, nên khả năng bắt lỗi chính tả không bị mất.
+    if (chemblOk) {
+      const wanted = String(drugName).trim().toUpperCase();
+      for (const m of (chemblRes.value.data?.molecules || [])) {
+        const names = [m.pref_name, ...(m.molecule_synonyms || []).map((s) => s.molecule_synonym)]
+          .filter(Boolean).map((x) => String(x).trim().toUpperCase());
+        if (names.includes(wanted)) {
+          return res.json({ valid: true, chemblId: m.molecule_chembl_id, matchedVia: 'chembl' });
+        }
+      }
     }
 
-    if (chemblRes.status === 'fulfilled') {
+    const suggestions = [];
+    if (autoOk) {
+      const items = autoRes.value.data?.dictionary_terms?.compound || [];
+      suggestions.push(...items);
+    } else if (autoRes.status !== 'fulfilled') {
+      console.error('[Validate] Autocomplete error:', autoRes.reason?.message);
+    } else {
+      console.warn('[Validate] PubChem autocomplete trả về không phải JSON — có thể đang bị chặn tạm (rate-limit).');
+    }
+
+    if (chemblOk) {
       const mols = chemblRes.value.data?.molecules || [];
       for (const m of mols) {
         const name = m.pref_name || m.molecule_chembl_id;
         if (name && !suggestions.includes(name)) suggestions.push(name);
       }
     } else {
-      console.error('[Validate] ChEMBL fallback error:', chemblRes.reason?.message);
+      console.error('[Validate] ChEMBL fallback error:', chemblRes.reason?.message || 'response không phải JSON');
+    }
+
+    // Cả PubChem lẫn ChEMBL đều đang gặp sự cố (không phải "không tìm thấy" thật, mà là KHÔNG XÁC
+    // MINH ĐƯỢC) — không chặn người dùng bằng cảnh báo sai, cho tiếp tục như khi lỗi mạng hoàn toàn.
+    if (pubchemBlocked && !chemblOk) {
+      return res.json({
+        valid: true,
+        sourceIssue: true,
+        warning: 'PubChem/ChEMBL đang tạm gặp sự cố (có thể do giới hạn tần suất truy vấn từ IP này) — không thể xác minh chắc chắn tên hoạt chất lúc này. Đã tự động cho tiếp tục tra cứu.',
+      });
     }
 
     return res.json({ valid: false, suggestions: suggestions.slice(0, 8) });
@@ -2137,6 +2188,783 @@ ${ctx || '(Người dùng chưa nạp dữ liệu mục nào — hãy trả lờ
       .map((m) => ({ role: m.role, content: String(m.content) }));
     const reply = await callOpenAI(openaiKey, [system, ...chatMsgs], model || 'deepseek/deepseek-chat', 3, 8000);
     res.json({ reply });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Module Lựa chọn sản phẩm: Tìm PATENT DẠNG BÀO CHẾ của nhà sản xuất thuốc gốc ────
+// ── Tìm patent DẠNG BÀO CHẾ gốc — ĐA NGUỒN (chống bịa) ──────────────────────────
+// Trước đây route này chỉ hỏi 1 AI rồi tin luôn — đã bắt được AI bịa số patent nghe hợp lý
+// (vd với moxifloxacin nhỏ mắt, AI trả US6231880 "của Alcon" nhưng thực tế đó là patent về
+// rối loạn máu của Susan Perrine; US6541021 thực tế là thiết bị giảm đau của Durect Corp).
+// Kiến trúc mới: tìm ứng viên từ NHIỀU nguồn thật → xác minh từng cái → AI chỉ PHÂN LOẠI
+// (không được tự sinh số patent mới) → code lọc lại lần cuối.
+
+// Chuẩn hoá số patent để so sánh/khử trùng lặp (bỏ khoảng trắng, hoa, bỏ hậu tố A1/B2...).
+function normalizePatentId(raw) {
+  return String(raw || '').toUpperCase().replace(/\s+/g, '').replace(/[^A-Z0-9]/g, '');
+}
+function patentCoreId(raw) {
+  // "US6716830B2" -> "US6716830" — để so khớp dù nguồn ghi kèm/không kèm hậu tố kind-code.
+  // QUAN TRỌNG: chỉ cắt khi chữ cái kind-code đứng NGAY SAU MỘT CHỮ SỐ (lookbehind \d) — nếu
+  // không có ràng buộc này, regex cũ từng khớp nhầm cả patent KHÔNG có hậu tố (vd Orange Book
+  // "US8685934" toàn số) vì [A-Z]\d*$ vẫn khớp được từ chữ "S" ở đầu, cắt trơ trọi còn "U".
+  return normalizePatentId(raw).replace(/(?<=\d)[A-Z]\d{0,2}$/, '');
+}
+
+// So sánh BEST-EFFORT xem applicant của 1 patent có vẻ KHÁC hãng phát minh (originator) đã xác
+// định không — để cảnh báo minh bạch (KHÔNG tự động loại patent, vì so khớp tên công ty rất dễ
+// sai — tên viết tắt, công ty con, đổi tên qua thời gian...).
+function companiesLikelyDiffer(applicant, originator) {
+  if (!applicant || !originator) return false; // thiếu dữ liệu để so sánh -> không cảnh báo oan
+  const norm = (s) => String(s).toUpperCase()
+    .replace(/\b(LLC|INC|CORP(?:ORATION)?|CO|LTD|GMBH|AG|THE|LABORATORIES|LABS?|PHARMACEUTICALS?|PHARMA)\b/g, '')
+    .replace(/[^A-Z0-9 ]/g, '').replace(/\s+/g, ' ').trim();
+  const a = norm(applicant), o = norm(originator);
+  if (!a || !o) return false;
+  if (a.includes(o) || o.includes(a)) return false; // 1 chuỗi chứa chuỗi kia -> coi như cùng hãng
+  const aWords = a.split(' ').filter((w) => w.length >= 4);
+  const oWords = o.split(' ').filter((w) => w.length >= 4);
+  if (aWords.some((w) => oWords.includes(w))) return false; // có từ chung đáng kể -> không cảnh báo
+  return true;
+}
+
+// Nguồn 1: Serper (Google search) — thực nghiệm cho kết quả ĐÚNG NHẤT, kể cả patent đã hết hạn
+// (vd tìm ra đúng US6716830B2 cho "moxifloxacin ophthalmic" ở vị trí #1, trong khi Google Patents
+// XHR nội bộ xếp hạng kém hơn hẳn cho cùng truy vấn).
+async function findCandidatesViaSerper(drugName, formEn, serperKey) {
+  if (!serperKey) return [];
+  const queries = [
+    `${drugName} ${formEn} formulation patent site:patents.google.com`,
+    `${drugName} ${formEn} composition patent site:patents.google.com`,
+    `${drugName} crystalline polymorph patent site:patents.google.com`,
+  ].filter((q, i, arr) => arr.indexOf(q) === i);
+
+  const out = [];
+  const settled = await Promise.allSettled(queries.map((q) => serperSearch(q, serperKey, 10)));
+  for (const s of settled) {
+    if (s.status !== 'fulfilled') continue;
+    for (const o of (s.value.organic || [])) {
+      const m = (o.link || '').match(/patents\.google\.com\/patent\/([A-Z]{2}\d[\w]*)/i);
+      if (!m) continue;
+      out.push({
+        patentNumber: m[1].toUpperCase(),
+        title: o.title || '',
+        snippet: o.snippet || '',
+        sourceUrl: `https://patents.google.com/patent/${m[1].toUpperCase()}/en`,
+        source: 'serper',
+      });
+    }
+  }
+  return out;
+}
+
+// Nguồn 2: FDA Orange Book (dữ liệu chính thức, đã tải/parse sẵn qua loadOrangeBook()) — chỉ có
+// patent CHƯA hết hạn nhưng đi kèm applicant chuẩn xác, không cần đối chiếu thêm.
+async function findCandidatesViaOrangeBook(drugName) {
+  try {
+    const ob = await loadOrangeBook();
+    const entry = ob.byDrug[drugName.toLowerCase().trim()];
+    if (!entry) return [];
+    return entry.patents.map((p) => ({
+      patentNumber: `US${String(p.code || '').replace(/\D/g, '')}`,
+      title: '',
+      applicant: p.applicant || '',
+      expiryDate: p.expireDate || '',
+      sourceUrl: p.sourceUrl,
+      source: 'orange-book',
+      officialVerified: true, // dữ liệu FDA chính thức — không cần đối chiếu Google Patents
+    }));
+  } catch (e) {
+    console.warn('[OriginatorPatent] Orange Book không dùng được:', e.message);
+    return [];
+  }
+}
+
+// Nguồn 3: Google Patents XHR — bổ sung, chấp nhận lỗi/503 (không chặn luồng chính).
+async function findCandidatesViaGooglePatents(drugName, formEn) {
+  try {
+    const results = await searchGooglePatentsDirect(`${drugName} ${formEn} formulation`, 2);
+    return results.map((r) => ({
+      patentNumber: (r.publicationNumber || '').toUpperCase(),
+      title: r.title || '',
+      applicant: r.assignee || '',
+      filingDate: r.filingDate || '',
+      sourceUrl: r.link,
+      pdfUrl: r.pdfUrl || null,
+      source: 'google-patents',
+    })).filter((r) => r.patentNumber);
+  } catch (e) {
+    return [];
+  }
+}
+
+// Nguồn 4: AI gợi ý — CHỈ để mở rộng danh sách ứng viên, KHÔNG còn là nguồn quyết định (mọi ứng
+// viên đều bị đối chiếu ở bước sau như các nguồn khác).
+async function findCandidatesViaAI(drugName, dosageFormVi, openaiKey) {
+  try {
+    const text = await callOpenAI(openaiKey, [
+      { role: 'system', content: 'Bạn là chuyên gia sáng chế dược. Chỉ liệt kê số patent CÓ THẬT bạn biết/tìm được qua web, không bịa. Trả JSON {"candidates":[{"patentNumber":"US..."}]}, không markdown.' },
+      { role: 'user', content: `Liệt kê các patent dạng bào chế (công thức, dạng tinh thể, bao phim, giải phóng kiểm soát) của nhà sản xuất thuốc gốc cho hoạt chất "${drugName}"${dosageFormVi ? `, dạng bào chế "${dosageFormVi}"` : ''}.` },
+    ], 'deepseek/deepseek-chat:online', 2, 3000);
+    const parsed = safeParseJSON(text) || {};
+    return (Array.isArray(parsed.candidates) ? parsed.candidates : [])
+      .map((c) => ({ patentNumber: normalizePatentId(c.patentNumber), source: 'ai' }))
+      .filter((c) => c.patentNumber);
+  } catch (e) {
+    return [];
+  }
+}
+
+// Xác minh 1 patent với Google Patents — trả 1 trong 3 TRẠNG THÁI (KHÔNG chỉ true/false như
+// bản trước, vì bản trước từng LOẠI NHẦM patent thật khi Google trả 503/lỗi tạm thời):
+//   verified   — tên hoạt chất CÓ xuất hiện trong tiêu đề/nội dung patent thật.
+//   rejected   — patent tồn tại nhưng KHÔNG nhắc hoạt chất, hoặc 404 (bằng chứng patent sai).
+//   unverified — không tải được (503/timeout) — CHƯA CHỨNG MINH ĐƯỢC GÌ, vẫn giữ lại và gắn nhãn
+//                cảnh báo thay vì âm thầm loại bỏ.
+async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
+  const id = normalizePatentId(patentNumber);
+  if (!/^(US|EP|WO|CA|CN)[A-Z0-9]+$/i.test(id)) {
+    return { status: 'rejected', reason: 'Mã patent không hợp lệ' };
+  }
+  // Nếu snippet/title từ Serper đã nhắc rõ hoạt chất, dùng luôn làm bằng chứng sơ bộ để giảm số
+  // lần phải tải trang patent (đỡ bị Google Patents chặn 503 do gọi dồn dập).
+  const drugUpper = String(drugName || '').toUpperCase().trim();
+  const hintText = `${hint?.title || ''} ${hint?.snippet || ''}`.toUpperCase();
+  const hintMatches = drugUpper && hintText.includes(drugUpper);
+
+  const url = `https://patents.google.com/patent/${id}/en`;
+  const maxRetries = 2;
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const r = await axios.get(url, {
+        timeout: 20000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+        validateStatus: (s) => s === 200 || s === 404 || s === 503,
+      });
+      if (r.status === 503) {
+        if (attempt < maxRetries - 1) { await delay(1500 * (attempt + 1)); continue; }
+        // Hết lượt thử mà vẫn 503: nếu có bằng chứng từ Serper thì tạm coi verified (nguồn độc
+        // lập đã xác nhận), không thì unverified — KHÔNG loại bỏ oan.
+        return hintMatches
+          ? { status: 'verified', realTitle: hint.title, verifiedUrl: url, viaHint: true }
+          : { status: 'unverified', reason: 'Google Patents đang chặn tạm thời (503) — chưa đối chiếu được' };
+      }
+      if (r.status === 404) return { status: 'rejected', reason: 'Không tồn tại trên Google Patents' };
+
+      const cheerio = require('cheerio');
+      const $ = cheerio.load(r.data);
+      $('script, style').remove();
+      const body = $('body').text().toUpperCase();
+      const title = ($('meta[name="DC.title"]').attr('content')
+        || $('span[itemprop="title"]').first().text()
+        || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      // Lấy CHỦ SỞ HỮU THẬT (assignee) ngay trong lúc đối chiếu — vì trang đã tải rồi, tận dụng
+      // luôn thay vì để trống. Đây là bản vá cho lỗi: patent tìm qua Serper không có applicant,
+      // khiến giao diện ẩn trường "Người nộp" và gây hiểu lầm patent thuộc về hãng gốc trong khi
+      // thực ra là của hãng khác (vd 4 patent hiện dưới "McNeil — Tylenol" hoá ra là của GSK/hãng TQ).
+      // DC.contributor liệt kê CẢ nhà phát minh lẫn công ty — ưu tiên mục nào có đuôi tên công ty.
+      const contributors = $('meta[name="DC.contributor"]').map((_, x) => $(x).attr('content')).get()
+        .map((s) => (s || '').trim()).filter(Boolean);
+      const companyPattern = /\b(LLC|Inc|Corp|Corporation|Co\.?|Ltd|GmbH|AG|Laboratories|Pharma|Pharmaceuticals?|University|Institute|S\.A\.|N\.V\.)\b/i;
+      const realApplicant = contributors.find((c) => companyPattern.test(c))
+        || (contributors.length && contributors[contributors.length - 1] !== 'Individual' ? contributors[contributors.length - 1] : '');
+      if (drugUpper && !body.includes(drugUpper)) {
+        return { status: 'rejected', reason: `Nội dung patent không nhắc tới "${drugName}"`, realTitle: title };
+      }
+      return { status: 'verified', realTitle: title, realApplicant, verifiedUrl: url };
+    } catch (e) {
+      if (attempt < maxRetries - 1) { await delay(1000); continue; }
+      return hintMatches
+        ? { status: 'verified', realTitle: hint.title, verifiedUrl: url, viaHint: true }
+        : { status: 'unverified', reason: 'Không tải được trang patent để đối chiếu: ' + e.message };
+    }
+  }
+  return { status: 'unverified', reason: 'Không xác minh được' };
+}
+
+app.post('/api/product-selection/originator-patent', requireApprovedUser, async (req, res) => {
+  const { drugName, dosageForm } = req.body;
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  const serperKey = req.body.serperKey || process.env.SERPER_API_KEY;
+  if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+  if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
+
+  try {
+    const normalized = normalizeDosageForm(dosageForm);
+    const formEn = normalized.en || 'formulation';
+
+    // BƯỚC 1 — tìm ứng viên từ 4 nguồn song song (allSettled: 1 nguồn lỗi không chặn các nguồn khác).
+    const [serperC, obC, gpC, aiC] = await Promise.all([
+      findCandidatesViaSerper(drugName, formEn, serperKey),
+      findCandidatesViaOrangeBook(drugName),
+      findCandidatesViaGooglePatents(drugName, formEn),
+      findCandidatesViaAI(drugName, normalized.vi || dosageForm, openaiKey),
+    ]);
+
+    // Gộp + khử trùng lặp theo mã patent lõi (bỏ hậu tố kind-code), GIỮ nguồn đầu tiên gặp theo
+    // thứ tự ưu tiên: Orange Book (chính thức) > Serper (đáng tin nhất qua test) > Google Patents > AI.
+    const byCoreId = new Map();
+    for (const list of [obC, serperC, gpC, aiC]) {
+      for (const c of list) {
+        const core = patentCoreId(c.patentNumber);
+        if (!core || byCoreId.has(core)) continue;
+        byCoreId.set(core, c);
+      }
+    }
+    const candidates = Array.from(byCoreId.values());
+
+    if (!candidates.length) {
+      return res.json({
+        originator: '', brand: '', dosageForm: normalized.vi || dosageForm,
+        formulationPatents: [], rejectedPatents: [],
+        overallNote: 'Không tìm được ứng viên patent nào từ các nguồn (Serper/Orange Book/Google Patents/AI) cho hoạt chất này.',
+        googlePatentsUrl: `https://patents.google.com/?q=${encodeURIComponent(drugName)}+formulation`,
+      });
+    }
+
+    // BƯỚC 2 — xác minh TỪNG ứng viên (song song). Orange Book đã là nguồn chính thức, bỏ qua bước
+    // đối chiếu Google Patents (officialVerified).
+    const verifications = await Promise.all(candidates.map((c) =>
+      c.officialVerified
+        ? Promise.resolve({ status: 'verified', realTitle: c.title, verifiedUrl: c.sourceUrl, official: true })
+        : verifyPatentAgainstGooglePatents(c.patentNumber, drugName, c)
+    ));
+
+    const verifiedList = [];
+    const rejectedList = [];
+    const unverifiedList = [];
+    candidates.forEach((c, i) => {
+      const v = verifications[i];
+      const merged = Object.assign({}, c, {
+        patentNumber: normalizePatentId(c.patentNumber),
+        realTitle: v.realTitle || c.title || '',
+        // Ưu tiên applicant LẤY THẬT trong lúc đối chiếu (v.realApplicant) — nguồn Serper không có
+        // applicant sẵn nên trước đây bị bỏ trống, khiến người dùng không thấy patent thực ra
+        // thuộc hãng khác (không phải hãng phát minh gốc).
+        applicant: v.realApplicant || c.applicant || '',
+        sourceUrl: v.verifiedUrl || c.sourceUrl,
+        verifyStatus: v.status,
+      });
+      if (v.status === 'verified') verifiedList.push(merged);
+      else if (v.status === 'rejected') rejectedList.push({ patentNumber: merged.patentNumber, reason: v.reason, realTitle: v.realTitle || '' });
+      else unverifiedList.push(Object.assign(merged, { unverifiedReason: v.reason }));
+    });
+
+    if (rejectedList.length) {
+      console.log(`[OriginatorPatent] Loại ${rejectedList.length} patent không qua đối chiếu:`, rejectedList.map((r) => r.patentNumber).join(', '));
+    }
+
+    // BƯỚC 3 — AI CHỈ PHÂN LOẠI (originator/brand + patentType + có phải patent dạng bào chế
+    // không), KHÔNG được thêm patent mới. Chỉ gửi patent đã verified/unverified (đã có bằng
+    // chứng ở mức nào đó) — KHÔNG gửi patent đã bị rejected.
+    const toClassify = [...verifiedList, ...unverifiedList];
+    // "originators" là MẢNG (không phải 1 tên duy nhất) — vì thuốc cũ, bán toàn cầu, đổi chủ nhiều
+    // lần qua M&A thường có NHIỀU dòng hãng gốc hợp pháp song song. Ví dụ thật đã gặp: paracetamol
+    // viên nén gốc là "Panadol" (Anh, 1956, Sterling Drug) — qua M&A trở thành tài sản hợp pháp của
+    // GlaxoSmithKline ngày nay — SONG SONG với "Tylenol" (Mỹ, McNeil/J&J). Ép AI chọn 1 tên duy nhất
+    // từng khiến patent của GSK (đúng, hợp pháp) bị gắn nhầm nhãn "khác hãng".
+    let classification = { originators: [], overallNote: '', items: {} };
+    if (toClassify.length) {
+      const listText = toClassify.map((p) => `${p.patentNumber} — ${p.realTitle || '(không có tiêu đề)'} — ${p.applicant || ''}`).join('\n');
+      const runClassification = () => callOpenAI(openaiKey, [
+        {
+          role: 'system',
+          content: `Bạn là chuyên gia sáng chế dược kiêm lịch sử ngành dược. Bạn được cho DANH SÁCH patent CÓ THẬT (đã xác minh) liên quan tới hoạt chất "${drugName}".
+NHIỆM VỤ:
+1. Xác định TẤT CẢ các DÒNG HÃNG GỐC HỢP PHÁP của hoạt chất/dạng bào chế này — KHÔNG ép về 1 cái tên duy nhất.
+   ĐIỀU KIỆN BẮT BUỘC để 1 công ty được liệt kê vào "originators" — PHẢI thoả CẢ HAI:
+     (a) Công ty đó THỰC SỰ là bên PHÁT MINH/ĐƯA RA THỊ TRƯỜNG ĐẦU TIÊN dưới một THƯƠNG HIỆU RIÊNG
+         (trademark thật, vd "Panadol", "Diprivan", "Tylenol"), HOẶC là bên kế thừa hợp pháp của
+         thương hiệu đó qua M&A có căn cứ lịch sử rõ ràng.
+     (b) Trường "brand" PHẢI LÀ TÊN THƯƠNG HIỆU THẬT (trademark) — TUYỆT ĐỐI KHÔNG được điền tên
+         hoạt chất/INN (vd không được điền "Propofol" hay "Paracetamol" làm brand — nếu không biết
+         brand thật của công ty đó thì KHÔNG liệt kê công ty đó vào "originators").
+   TUYỆT ĐỐI KHÔNG liệt kê các hãng SẢN XUẤT GENERIC — dù công ty đó CÓ patent bào chế riêng (patent
+   công thức/dạng bào chế do hãng generic tự phát triển SAU KHI hoạt chất đã hết bảo hộ hoàn toàn
+   KHÔNG làm công ty đó trở thành "hãng phát minh"). Dấu hiệu nhận biết hãng generic: chỉ bán ở 1
+   thị trường nội địa hẹp (vd chỉ Ấn Độ, chỉ Trung Quốc), không có thương hiệu quốc tế công nhận,
+   patent nộp rất lâu sau khi hoạt chất đã phổ biến toàn cầu.
+   - Thuốc hiện đại (1 hãng phát minh rõ ràng, chưa đổi chủ) → mảng "originators" chỉ có 1 phần tử.
+   - Thuốc cũ/bán ở nhiều khu vực với thương hiệu KHÁC NHAU nhưng ĐỀU LÀ THƯƠNG HIỆU GỐC THẬT (không
+     phải hàng generic), hoặc công ty đã đổi chủ qua M&A → liệt kê ĐỦ các dòng, mỗi dòng gồm:
+     "company" (tên hãng sở hữu hợp pháp ngày nay, có thể ghi chuỗi kế thừa vd "Sterling Drug ->
+     SmithKline Beecham -> GSK"), "brand" (thương hiệu THẬT), "region" (khu vực/thị trường chính).
+   - CHỈ liệt kê dòng có căn cứ hợp lý; không bịa chuỗi M&A không có thật. Thà liệt kê THIẾU còn hơn
+     liệt kê SAI (thêm nhầm hãng generic vào danh sách hãng phát minh).
+2. Với MỖI patent trong danh sách: xác định "isFormulation" (true nếu là patent DẠNG BÀO CHẾ — công thức, dạng tinh thể/polymorph, bao phim, giải phóng kiểm soát, quy trình sản xuất; false nếu là patent hợp chất cơ bản/phương pháp điều trị/không liên quan bào chế), "patentType" (Dạng tinh thể|Công thức bào chế|Bao phim|Giải phóng kiểm soát|Quy trình sản xuất|Khác), "status" (còn hạn|hết hạn|không rõ).
+TUYỆT ĐỐI KHÔNG thêm patent nào ngoài danh sách được cho. CHỈ dùng đúng các mã patent đã cho.
+Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"overallNote":"...","items":{"<patentNumber>":{"isFormulation":true,"patentType":"...","status":"..."}}}`,
+        },
+        { role: 'user', content: `Hoạt chất: "${drugName}"${dosageForm ? `, dạng bào chế: "${dosageForm}"` : ''}.\n\nDanh sách patent đã xác minh:\n${listText}` },
+      ], 'deepseek/deepseek-chat', 3, 4000);
+
+      // AI đôi khi trả JSON "thành công" (không lỗi HTTP) nhưng thiếu hẳn "originators" — hiện
+      // tượng thoáng qua đã gặp thực tế (không phải do bị cắt token, đã kiểm bằng log: field này
+      // luôn đứng đầu và đóng đúng cấu trúc). Vì hậu quả là hiện "không xác định" gây hiểu lầm
+      // (đọc như "không có hãng phát minh nào", trong khi thực ra chỉ là lượt phân loại bị hỏng),
+      // nên THỬ LẠI THÊM 1 LẦN trước khi chấp nhận kết quả rỗng.
+      const MAX_CLASSIFY_ATTEMPTS = 3; // nâng từ 2 lên 3 — đã thấy thực tế lỗi thoáng qua này đủ
+      // thường xuyên để 2 lần thử đôi khi vẫn cùng dính lỗi.
+      for (let attempt = 0; attempt < MAX_CLASSIFY_ATTEMPTS; attempt++) {
+        try {
+          const text = await runClassification();
+          const parsed = safeParseJSON(text);
+          const originators = Array.isArray(parsed?.originators) ? parsed.originators : [];
+          if (originators.length || attempt === MAX_CLASSIFY_ATTEMPTS - 1) {
+            classification = Object.assign(classification, parsed || {}, { originators, items: parsed?.items || {} });
+            console.log(`[OriginatorPatent] Phân loại xong (lượt ${attempt + 1}/${MAX_CLASSIFY_ATTEMPTS}): originators=${originators.length}, items=${Object.keys(parsed?.items || {}).length}`);
+            break;
+          }
+          console.warn(`[OriginatorPatent] Lượt ${attempt + 1} trả "originators" rỗng bất thường — thử lại.`);
+        } catch (e) {
+          console.warn('[OriginatorPatent] Bước phân loại AI lỗi (vẫn trả patent thô):', e.message);
+          break;
+        }
+      }
+    }
+
+    // BƯỚC 4 — lọc theo "chỉ patent dạng bào chế" (yêu cầu đã chốt) + gắn patentType/status.
+    // Patent nào AI không phân loại được (lỗi/không có trong "items") vẫn GIỮ (không âm thầm bỏ),
+    // đánh dấu patentType mặc định để người dùng tự đánh giá thay vì mất dữ liệu.
+    const originatorCompanies = classification.originators.map((o) => o.company).filter(Boolean);
+    const applyClassification = (p) => {
+      const cls = classification.items[p.patentNumber] || classification.items[normalizePatentId(p.patentNumber)];
+      return Object.assign({}, p, {
+        patentType: cls?.patentType || 'Chưa phân loại',
+        status: cls?.status || '',
+        isFormulation: cls ? !!cls.isFormulation : true, // không rõ -> vẫn giữ, coi là có thể liên quan
+        // KHÁC hãng = applicant CÓ dữ liệu và khác TẤT CẢ các dòng hãng gốc hợp pháp — best-effort.
+        differentCompany: originatorCompanies.length > 0 && !!p.applicant
+          && originatorCompanies.every((oc) => companiesLikelyDiffer(p.applicant, oc)),
+      });
+    };
+    // Người dùng yêu cầu: CHỈ hiện patent khớp với nhà sản xuất biệt dược gốc — patent xác định
+    // được là của hãng KHÁC thì loại hẳn khỏi danh sách chính (không chỉ cảnh báo như trước).
+    // Patent chưa xác định được applicant (vd Google Patents đang chặn tạm) vẫn GIỮ — không đủ căn
+    // cứ để khẳng định "không phải hãng gốc" nên loại oan sẽ mất dữ liệu thật một cách vô lý.
+    const classified = [...verifiedList.map(applyClassification), ...unverifiedList.map(applyClassification)]
+      .filter((p) => p.isFormulation);
+    const nonOriginatorPatents = classified.filter((p) => p.differentCompany);
+    const finalVerified = classified.filter((p) => !p.differentCompany && p.verifyStatus !== 'unverified');
+    const finalUnverified = classified.filter((p) => !p.differentCompany && p.verifyStatus === 'unverified');
+
+    res.json({
+      originators: classification.originators,
+      dosageForm: normalized.vi || dosageForm,
+      formulationPatents: finalVerified,
+      unverifiedPatents: finalUnverified,
+      rejectedPatents: rejectedList,
+      nonOriginatorPatents: nonOriginatorPatents.map((p) => ({ patentNumber: p.patentNumber, applicant: p.applicant, realTitle: p.realTitle })),
+      overallNote: classification.overallNote || '',
+      googlePatentsUrl: `https://patents.google.com/?q=${encodeURIComponent(drugName)}+formulation`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Module Lựa chọn sản phẩm: Duyệt thuốc theo năm hết hạn (FDA Orange Book) ───
+const ORANGE_BOOK_ZIP_URL = 'https://www.fda.gov/media/76860/download';
+const ORANGE_BOOK_SOURCE_URL = 'https://www.accessdata.fda.gov/scripts/cder/ob/index.cfm';
+let _orangeBookData = null;
+let _orangeBookFetchedAt = 0;
+
+function parseTildeLines(text) {
+  const lines = String(text || '').split(/\r?\n/).filter((l) => l.trim().length);
+  if (!lines.length) return [];
+  const headers = lines[0].split('~');
+  return lines.slice(1).map((line) => {
+    const cols = line.split('~');
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = (cols[i] || '').trim(); });
+    return obj;
+  });
+}
+
+function buildOrangeBookIndex(productsTxt, patentTxt, exclusivityTxt) {
+  const products = parseTildeLines(productsTxt);
+  const patents = parseTildeLines(patentTxt);
+  const exclusivities = parseTildeLines(exclusivityTxt);
+
+  const keyOf = (r) => `${r.Appl_Type}|${r.Appl_No}|${r.Product_No}`;
+  const productByKey = {};
+  for (const p of products) productByKey[keyOf(p)] = p;
+
+  const parseYear = (dateText) => {
+    const d = new Date(dateText);
+    return isNaN(d.getTime()) ? null : d.getFullYear();
+  };
+
+  const byDrug = {}; // ingredient/trade_name (lowercase) -> { drugName, patents:[], exclusivities:[] }
+  const flat = [];
+
+  const addRow = (kind, row, prod) => {
+    if (!prod) return;
+    const dateField = kind === 'patent' ? row.Patent_Expire_Date_Text : row.Exclusivity_Date;
+    const entry = {
+      drug: prod.Ingredient, kind,
+      code: kind === 'patent' ? row.Patent_No : row.Exclusivity_Code,
+      expireDate: dateField, year: parseYear(dateField),
+      applicant: prod.Applicant_Full_Name || prod.Applicant,
+      sourceUrl: ORANGE_BOOK_SOURCE_URL,
+    };
+    flat.push(entry);
+    for (const key of [(prod.Ingredient || '').toLowerCase(), (prod.Trade_Name || '').toLowerCase()]) {
+      if (!key) continue;
+      if (!byDrug[key]) byDrug[key] = { drugName: prod.Ingredient, patents: [], exclusivities: [] };
+      byDrug[key][kind === 'patent' ? 'patents' : 'exclusivities'].push(entry);
+    }
+  };
+
+  for (const pat of patents) addRow('patent', pat, productByKey[keyOf(pat)]);
+  for (const exc of exclusivities) addRow('exclusivity', exc, productByKey[keyOf(exc)]);
+
+  return { byDrug, flat, productCount: products.length };
+}
+
+async function loadOrangeBook() {
+  const now = Date.now();
+  if (_orangeBookData && now - _orangeBookFetchedAt < 30 * 24 * 60 * 60 * 1000) return _orangeBookData;
+
+  const fs = require('fs');
+  const localPath = path.join(__dirname, 'orange-book-data.json');
+
+  try {
+    const zipRes = await axios.get(ORANGE_BOOK_ZIP_URL, {
+      responseType: 'arraybuffer', timeout: 60000, headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    const AdmZip = require('adm-zip');
+    const zip = new AdmZip(Buffer.from(zipRes.data));
+    const entries = zip.getEntries();
+    const readEntry = (name) => {
+      const entry = entries.find((e) => e.entryName.toLowerCase() === name);
+      return entry ? zip.readAsText(entry) : '';
+    };
+    const parsed = buildOrangeBookIndex(readEntry('products.txt'), readEntry('patent.txt'), readEntry('exclusivity.txt'));
+    _orangeBookData = parsed;
+    _orangeBookFetchedAt = now;
+    console.log(`[OrangeBook] Tải từ FDA: ${parsed.productCount} sản phẩm, ${parsed.flat.length} dòng patent/độc quyền.`);
+    fs.writeFile(localPath, JSON.stringify(parsed), 'utf8', () => {});
+    return parsed;
+  } catch (e) {
+    console.warn('[OrangeBook] Tải từ FDA thất bại, thử bản sao lưu cục bộ:', e.message);
+  }
+
+  if (fs.existsSync(localPath)) {
+    try {
+      const localData = JSON.parse(fs.readFileSync(localPath, 'utf8'));
+      _orangeBookData = localData;
+      _orangeBookFetchedAt = now;
+      console.log('[OrangeBook] Dùng bản sao lưu cục bộ.');
+      return localData;
+    } catch (err) {
+      console.error('[OrangeBook] Lỗi đọc bản sao lưu cục bộ:', err.message);
+    }
+  }
+
+  throw new Error('Không thể tải dữ liệu Orange Book (FDA) và không có bản sao lưu cục bộ.');
+}
+
+app.get('/api/product-selection/expiry-browse', requireApprovedUser, async (req, res) => {
+  const year = parseInt(req.query.year, 10);
+  if (!year) return res.status(400).json({ error: 'Thiếu hoặc sai tham số year' });
+  try {
+    const ob = await loadOrangeBook();
+    const items = ob.flat
+      .filter((r) => r.year === year)
+      .sort((a, b) => (a.drug || '').localeCompare(b.drug || ''))
+      .slice(0, 500); // giới hạn để phản hồi nhanh, tránh trả về quá nặng
+    res.json({ items, total: items.length, year });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Module Lựa chọn sản phẩm: Thư mục danh sách patent hết hạn (kiểu Pharsight/GreyB) ───
+// GreyB (Nuxt) giấu dữ liệu THUỐC/PATENT thật trong payload JS nội bộ, không nằm trong
+// <table> HTML — cào/suy luận dữ liệu đó không đáng tin, và chạy payload JS của bên thứ 3
+// trên server là rủi ro bảo mật không đáng đánh đổi. Nên module này CHỈ dựng một thư mục
+// các LINK THẬT dẫn sang trang GreyB gốc (mở tab mới) — không cào/hiển thị dữ liệu thuốc
+// của họ trong app. Dữ liệu chính thức (FDA Orange Book) vẫn xem được ngay trong app.
+//
+// Riêng TRANG THƯ MỤC (/drug-patent-expiration-lists) đã xác minh là HTML tĩnh bình thường
+// (cấu trúc div.grid-item > h2.list-heading + div.list-items > a[href]) — KHÔNG nằm trong
+// payload JS — nên an toàn để tự cào lại mỗi ngày, giữ danh mục luôn khớp với trang gốc.
+const GREYB_BASE = 'https://pharsight.greyb.com';
+const GREYB_HUB_URL = GREYB_BASE + '/drug-patent-expiration-lists';
+const GREYB_CACHE_FILE = path.join(__dirname, 'greyb-catalog-cache.json');
+const GREYB_REFRESH_MS = 24 * 60 * 60 * 1000; // mỗi ngày 1 lần
+
+// Bản dự phòng cứng (chụp thủ công) — dùng khi CHƯA từng cào thành công lần nào
+// (server mới triển khai, chưa có cache đĩa) và lần cào đầu tiên cũng thất bại.
+const GREYB_CATALOG_FALLBACK = [
+  { group: 'Vừa diễn ra', items: [
+    { label: 'Patent vừa hết hạn', path: '/recently-expired' },
+    { label: 'Patent vừa được thêm', path: '/recently-added' },
+    { label: 'Patent vừa công bố', path: '/recently-published' },
+    { label: 'Tranh chấp patent gần đây', path: '/litigations' },
+  ]},
+  { group: 'Patent hết hạn trong 5 năm tới', items: [2026, 2027, 2028, 2029, 2030].map((y) =>
+    ({ label: `Patent hết hạn năm ${y}`, path: `/ask-pharsight/drug-patents-expiring-in-${y}` })) },
+  { group: 'Thuốc vào kỳ NCE-1 (mở khóa nộp ANDA Para IV)', items: [2026, 2027, 2028, 2029, 2030].map((y) =>
+    ({ label: `NCE-1 năm ${y}`, path: `/nce-1/${y}` })) },
+  { group: 'Bộ sưu tập chọn lọc', items: [
+    { label: 'Thuốc đang bị nộp Para IV', path: '/buckets/drugs-facing-para-iv-filings' },
+    { label: 'Thuốc đã hết patent chính', path: '/buckets/drugs-with-expired-main-patents' },
+    { label: 'Thuốc có chứng chỉ bảo hộ bổ sung (SPC)', path: '/buckets/drugs-with-spc' },
+    { label: 'Thuốc thận học', path: '/therapeutics/nephrology' },
+    { label: 'Thuốc đái tháo đường', path: '/therapeutics/diabetology' },
+  ]},
+  { group: 'Mới thêm gần đây', items: [
+    { label: 'Top 10 thuốc bom tấn hết patent 2026', path: '/articles/top-10-blockbuster-drugs-expiring-in-2026' },
+    { label: 'Độc quyền Orange Book hết hạn 2026', path: '/collections/drugs-with-exclusivities-expiring-in-2026' },
+    { label: 'Cơ hội thách thức patent', path: '/patent-challenge-opportunities' },
+    { label: 'Thuốc ung thư', path: '/therapeutics/cancer' },
+  ]},
+  { group: 'Hãng sản xuất generic (đang nhắm thuốc bom tấn)', items: [
+    { label: 'Lupin Ltd', path: '/company/lupin-drug-patent-portfolio' },
+    { label: 'Sandoz', path: '/company/sandoz-drug-patent-portfolio' },
+    { label: 'Mylan', path: '/company/mylan-drug-patent-portfolio' },
+  ]},
+];
+
+let _greybCatalogLive = null; // { groups: [{group, items:[{label,url}]}], fetchedAt }
+
+// Cào TRANG THƯ MỤC (chỉ lấy cấu trúc nhóm + link, KHÔNG cào dữ liệu thuốc/patent bên trong).
+async function scrapeGreybCatalog() {
+  const cheerio = require('cheerio');
+  const htmlRes = await axios.get(GREYB_HUB_URL, {
+    timeout: 20000,
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+  });
+  const $ = cheerio.load(htmlRes.data);
+  const groups = [];
+  $('.grid-item').each((_, el) => {
+    const $el = $(el);
+    const groupTitle = $el.find('h2.list-heading').first().text().trim();
+    if (!groupTitle) return;
+    const items = $el.find('.list-items a[href]').toArray().map((a) => {
+      const $a = $(a);
+      const href = ($a.attr('href') || '').trim();
+      const label = $a.text().trim();
+      if (!label || !href) return null;
+      // Dùng URL chuẩn để ghép đúng trong mọi trường hợp — một số href trên trang GreyB
+      // KHÔNG có dấu "/" ở đầu (đường dẫn tương đối, không phải tuyệt đối); nối chuỗi tay
+      // (GREYB_BASE + href) sẽ dính liền sai thành ".comask-pharsight/..." với các href đó.
+      let url;
+      try { url = new URL(href, GREYB_HUB_URL).href; } catch (e) { return null; }
+      return { label, url };
+    }).filter(Boolean);
+    if (items.length) groups.push({ group: groupTitle, items });
+  });
+  return groups;
+}
+
+async function refreshGreybCatalog() {
+  const fs = require('fs');
+  try {
+    const groups = await scrapeGreybCatalog();
+    const totalItems = groups.reduce((s, g) => s + g.items.length, 0);
+    // Ngưỡng hợp lý tối thiểu — nếu GreyB đổi giao diện khiến cào ra quá ít, GIỮ NGUYÊN
+    // danh mục cũ thay vì ghi đè bằng dữ liệu rỗng/thiếu.
+    if (groups.length >= 3 && totalItems >= 10) {
+      // Dịch tên nhóm + tên mục sang tiếng Việt (1 lần/ngày cùng lúc cào — rẻ; nếu lỗi/không
+      // có key thì translateTexts tự trả nguyên văn tiếng Anh, không chặn luồng).
+      const openaiKey = process.env.OPENAI_API_KEY;
+      if (openaiKey) {
+        const flatTexts = [];
+        groups.forEach((g) => { flatTexts.push(g.group); g.items.forEach((it) => flatTexts.push(it.label)); });
+        const translated = await translateTexts(openaiKey, flatTexts);
+        let i = 0;
+        groups.forEach((g) => {
+          g.group = translated[i++] || g.group;
+          g.items.forEach((it) => { it.label = translated[i++] || it.label; });
+        });
+      }
+      _greybCatalogLive = { groups, fetchedAt: Date.now() };
+      fs.writeFile(GREYB_CACHE_FILE, JSON.stringify(_greybCatalogLive), 'utf8', () => {});
+      console.log(`[GreyB] Cập nhật thư mục: ${groups.length} nhóm, ${totalItems} mục.`);
+    } else {
+      console.warn(`[GreyB] Kết quả cào quá ít (${groups.length} nhóm, ${totalItems} mục) — giữ nguyên danh mục cũ.`);
+    }
+  } catch (e) {
+    console.warn('[GreyB] Cập nhật thư mục thất bại:', e.message, '— giữ nguyên danh mục cũ.');
+  }
+}
+
+// Khởi động: đọc cache đĩa (nếu có) để có dữ liệu ngay lập tức, rồi cào mới 1 lần, sau đó lặp lại mỗi ngày.
+(function initGreybCatalog() {
+  const fs = require('fs');
+  try {
+    if (fs.existsSync(GREYB_CACHE_FILE)) {
+      _greybCatalogLive = JSON.parse(fs.readFileSync(GREYB_CACHE_FILE, 'utf8'));
+      console.log(`[GreyB] Nạp cache đĩa: ${_greybCatalogLive.groups.length} nhóm.`);
+    }
+  } catch (e) {
+    console.warn('[GreyB] Lỗi đọc cache đĩa:', e.message);
+  }
+  refreshGreybCatalog();
+  setInterval(refreshGreybCatalog, GREYB_REFRESH_MS);
+})();
+
+app.get('/api/product-selection/greyb-catalog', requireApprovedUser, (req, res) => {
+  const groups = (_greybCatalogLive && _greybCatalogLive.groups && _greybCatalogLive.groups.length)
+    ? _greybCatalogLive.groups
+    : GREYB_CATALOG_FALLBACK.map((g) => ({
+        group: g.group,
+        items: g.items.map((it) => ({ label: it.label, url: GREYB_BASE + it.path })),
+      }));
+  // Luôn thêm nhóm "Dữ liệu chính thức" (không đến từ GreyB — không thuộc kết quả cào).
+  const withOfficial = [...groups, { group: 'Dữ liệu chính thức', items: [
+    { label: '🇺🇸 FDA Orange Book — duyệt theo năm', url: null },
+  ]}];
+  res.json({
+    catalog: withOfficial,
+    source: _greybCatalogLive ? 'live' : 'fallback',
+    fetchedAt: _greybCatalogLive?.fetchedAt || null,
+  });
+});
+
+// Tóm tắt nội dung 1 trang trong thư mục bằng AI (đọc toàn bộ text của trang).
+// Model: gemini-2.5-flash-lite — chọn sau khi test so sánh thật trên trang 461K ký tự:
+// nhanh nhất (8.1s), nêu 32 patent đều CÓ THẬT trong nguồn; trong khi gpt-5-nano rẻ hơn
+// nhưng đã BỊA tên thuốc ("Adderall" không hề có trong trang) nên bị loại.
+// Context của Gemini là 1.048.576 token, trang lớn nhất chỉ ~128.000 token → gửi TRỌN 1 lượt,
+// không cần chia nhỏ (chia nhỏ làm mất ngữ cảnh ở ranh giới, kém chính xác hơn).
+const _greybSummaryCache = new Map(); // url -> { summary, at, totalChars }
+const GREYB_SUMMARY_CACHE_MS = 24 * 60 * 60 * 1000;
+
+function isUrlInGreybCatalog(url) {
+  const groups = (_greybCatalogLive && _greybCatalogLive.groups && _greybCatalogLive.groups.length)
+    ? _greybCatalogLive.groups
+    : GREYB_CATALOG_FALLBACK.map((g) => ({ items: g.items.map((it) => ({ url: GREYB_BASE + it.path })) }));
+  return groups.some((g) => g.items.some((it) => it.url === url));
+}
+
+// Trích ĐẦY ĐỦ bảng patent từ trang GreyB bằng code (KHÔNG qua AI) — copy nguyên văn nên
+// không thể bịa, không sót dòng, tức thì và miễn phí. (Bắt AI chép lại danh sách đã thử và
+// thất bại: AI cắt cụt giữa số patent, mất luôn phần phân tích.)
+// Cấu trúc đã xác minh: mỗi thuốc là 1 bảng có th đầu = "Drug Patent Number", thường nằm
+// trong div.drug-wrapper với heading dạng "1. Abilify patent expiration".
+// LƯU Ý: trang company (vd Lupin) dùng header KHÁC (thiếu cột Company) → phải đọc header động.
+function extractGreybPatentRows($) {
+  const rows = [];
+  const cleanDrugName = (raw) => {
+    const t = String(raw || '').replace(/\s+/g, ' ').trim();
+    // Một số heading dính chữ quảng cáo phía trước ("...Download Report 3. Abraxane")
+    // → lấy lần khớp CUỐI CÙNG của mẫu "<số>. <tên>".
+    const all = [...t.matchAll(/(\d+)\.\s*([^.]+)$/g)];
+    let name = all.length ? all[all.length - 1][2] : t;
+    return name.replace(/patent\s*expiration\s*$/i, '').trim();
+  };
+
+  $('table').each((_, table) => {
+    const $t = $(table);
+    const headers = $t.find('th').map((_, th) => $(th).text().replace(/\s+/g, ' ').trim()).get();
+    if (!headers.length || !/^Drug Patent Number/i.test(headers[0])) return;
+
+    // Map cột theo header thực tế (cột nào không có thì -1 → để trống).
+    const idxOf = (re) => headers.findIndex((h) => re.test(h));
+    const iPatent = idxOf(/^Drug Patent Number/i);
+    const iCompany = idxOf(/^Company/i);
+    const iTitle = idxOf(/^Drug Patent Title/i);
+    const iExpiry = idxOf(/^Drug Patent Expiry/i);
+    const iStatus = idxOf(/^Status/i); // chỉ có ở trang công ty (vd Lupin)
+
+    // Tên thuốc: heading trong .drug-wrapper tổ tiên, không có thì heading đứng trước gần nhất.
+    let drug = '';
+    const wrapper = $t.closest('.drug-wrapper');
+    if (wrapper.length) drug = cleanDrugName(wrapper.find('h1,h2,h3,h4').first().text());
+    if (!drug) drug = cleanDrugName($t.prevAll('h1,h2,h3,h4').first().text());
+
+    $t.find('tbody tr').each((_, tr) => {
+      const c = $(tr).find('td').map((_, td) => $(td).text().replace(/\s+/g, ' ').trim()).get();
+      if (c.length < 2) return; // dòng mô tả (1 ô) — bỏ
+      const patent = iPatent >= 0 ? (c[iPatent] || '') : '';
+      if (!/^(US|EP|RE)/i.test(patent)) return; // không phải mã patent hợp lệ — bỏ
+      rows.push({
+        drug,
+        patent,
+        company: iCompany >= 0 ? (c[iCompany] || '') : '',
+        title: iTitle >= 0 ? (c[iTitle] || '') : '',
+        expiry: iExpiry >= 0 ? (c[iExpiry] || '') : '',
+        status: iStatus >= 0 ? (c[iStatus] || '') : '',
+      });
+    });
+  });
+  return rows;
+}
+
+app.post('/api/product-selection/summarize-link', requireApprovedUser, async (req, res) => {
+  const { url } = req.body;
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  if (!url) return res.status(400).json({ error: 'Thiếu URL' });
+  // Chỉ cho tóm tắt URL ĐANG có trong thư mục — không nhận URL tuỳ ý (chống SSRF).
+  if (!isUrlInGreybCatalog(url)) return res.status(400).json({ error: 'URL không nằm trong thư mục' });
+  if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
+
+  const cached = _greybSummaryCache.get(url);
+  if (cached && Date.now() - cached.at < GREYB_SUMMARY_CACHE_MS) {
+    return res.json({ summary: cached.summary, patentRows: cached.patentRows || [], url, totalChars: cached.totalChars, cached: true });
+  }
+
+  try {
+    const cheerio = require('cheerio');
+    const pageRes = await axios.get(url, {
+      timeout: 30000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+    });
+    const $ = cheerio.load(pageRes.data);
+    // Trích bảng patent TRƯỚC khi xoá script (bảng nằm trong body nên không ảnh hưởng, nhưng
+    // gọi trước cho rõ ràng về thứ tự).
+    const patentRows = extractGreybPatentRows($);
+    $('script, style, noscript, svg').remove();
+    const text = $('body').text().replace(/\s+/g, ' ').trim();
+    if (text.length < 300) {
+      return res.status(422).json({ error: 'Không đọc được nội dung trang này. Vui lòng mở trang gốc để xem trực tiếp.' });
+    }
+
+    const summary = await callOpenAI(openaiKey, [
+      {
+        role: 'system',
+        content: `Bạn là chuyên gia sáng chế dược, viết BẢN PHÂN TÍCH CHI TIẾT bằng TIẾNG VIỆT cho trang được cung cấp,
+phục vụ một dược sĩ R&D đang CHỌN SẢN PHẨM để nghiên cứu generic.
+
+QUY TẮC KHÔNG BỊA: chỉ dùng thông tin CÓ TRONG văn bản. Không bịa tên thuốc, số patent, ngày, công ty.
+Nếu văn bản không có thông tin cho một phần nào, ghi rõ "trang không nêu" thay vì tự suy diễn.
+
+Viết ĐẦY ĐỦ, CHI TIẾT, có số liệu cụ thể. Trả lời đúng 5 phần, ghi rõ số thứ tự ở đầu mỗi phần:
+
+(1) TỔNG QUAN — trang này là gì, phục vụ mục đích gì, dữ liệu gồm những loại thông tin nào (4-6 câu).
+
+(2) THỐNG KÊ TỔNG HỢP — đếm và nêu số liệu thực tế từ văn bản: khoảng bao nhiêu thuốc/patent được liệt kê,
+    phân bố theo tháng/năm hết hạn, những công ty xuất hiện nhiều nhất (kèm số lần nếu đếm được).
+
+(3) CÁC THUỐC ĐÁNG CHÚ Ý NHẤT — chọn 5-8 thuốc quan trọng/nổi tiếng nhất, với MỖI thuốc viết một đoạn
+    phân tích riêng: tên thuốc, công ty, hoạt chất (nếu có), chỉ định điều trị (nếu có), các patent và ngày
+    hết hạn, các loại độc quyền đang có, tình trạng kiện tụng/Para IV (nếu trang nêu), và nhận định vì sao
+    đáng chú ý với người làm generic.
+
+(4) CƠ HỘI & RÀO CẢN CHO GENERIC — phân tích cụ thể: thuốc nào sắp hết bảo hộ sớm nhất, thuốc nào chỉ còn
+    ít patent (dễ vào), thuốc nào còn vướng độc quyền (ODE/NCE/PED/NPP) hay đang tranh chấp patent nên khó,
+    mốc Para IV / 180-day exclusivity nếu trang có nêu.
+
+(5) MỐC THỜI GIAN QUAN TRỌNG — nhóm theo quý hoặc theo tháng, mỗi mốc chỉ nêu VÀI thuốc tiêu biểu.
+
+QUAN TRỌNG: KHÔNG liệt kê danh sách dài toàn bộ thuốc/patent — hệ thống đã tự trích bảng đầy đủ
+hiển thị riêng bên dưới bản phân tích của bạn. Nhiệm vụ của bạn là PHÂN TÍCH, không phải chép danh sách.
+KHÔNG dùng markdown, KHÔNG dùng dấu * hay #.`,
+      },
+      // Cắt an toàn — dư cho mọi trang hiện tại (lớn nhất ~461K), phòng trang phình bất thường.
+      { role: 'user', content: `Nội dung trang:\n\n${text.slice(0, 600000)}` },
+      // max output của gemini-2.5-flash-lite là 65.535 token; đặt 20.000 là đủ rộng cho bản phân
+      // tích chi tiết mà không để model "chạy loạn" đổ ra danh sách dài vô tận.
+    ], 'google/gemini-2.5-flash-lite', 2, 20000);
+
+    _greybSummaryCache.set(url, { summary, patentRows, at: Date.now(), totalChars: text.length });
+    res.json({ summary, patentRows, url, totalChars: text.length, cached: false });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
