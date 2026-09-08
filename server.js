@@ -2514,6 +2514,10 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
         // thuộc hãng khác (không phải hãng phát minh gốc).
         applicant: v.realApplicant || c.applicant || '',
         applicantNote: v.applicantNote || '', // vd 'cá nhân' khi patent thuộc một người, không phải công ty
+        // true = KHÔNG mở được trang Google Patents (bị chặn 503), chỉ khớp nhờ đoạn trích từ kết
+        // quả tìm kiếm. Phải báo cho giao diện biết để không ghi "Đã đối chiếu Google Patents" —
+        // đó là khẳng định sai mức độ chắc chắn, và cũng là lý do "Người nộp" bị trống.
+        viaHint: !!v.viaHint,
         sourceUrl: v.verifiedUrl || c.sourceUrl,
         verifyStatus: v.status,
       });

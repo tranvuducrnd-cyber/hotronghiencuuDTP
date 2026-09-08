@@ -3222,7 +3222,12 @@ function pselPatentCardHtml(p, idx) {
     ? '<span class="psel-badge psel-badge-official">🏛️ FDA Orange Book (chính thức)</span>'
     : p.verifyStatus === 'unverified'
       ? `<span class="psel-badge psel-badge-warn" title="${escHtml(p.unverifiedReason || '')}">⚠️ Chưa xác minh được</span>`
-      : '<span class="psel-badge psel-badge-green">✓ Đã đối chiếu Google Patents</span>';
+      : p.viaHint
+        // Không mở được trang patent (Google Patents chặn tạm) — chỉ khớp qua đoạn trích tìm kiếm.
+        // Không được ghi "Đã đối chiếu Google Patents" vì thực tế chưa đối chiếu, và đây cũng chính
+        // là lý do trường "Người nộp" bị trống.
+        ? '<span class="psel-badge psel-badge-warn" title="Google Patents đang chặn tạm (503) nên chưa mở được trang patent — mới chỉ khớp tên hoạt chất trong kết quả tìm kiếm. Vì vậy chưa lấy được tên người nộp.">◐ Khớp qua kết quả tìm kiếm (chưa mở được trang patent)</span>'
+        : '<span class="psel-badge psel-badge-green">✓ Đã đối chiếu Google Patents</span>';
   const argsJson = escHtml(JSON.stringify([idx, p.patentNumber, p.sourceUrl, p.realTitle || p.patentNumber, p.pdfUrl || null]));
   return `
       <div class="section-card" style="margin:0 0 0.8rem;">
@@ -3234,7 +3239,14 @@ function pselPatentCardHtml(p, idx) {
         </div>
         <div class="mt-2"><b>Số patent:</b> <span class="mono">${escHtml(p.patentNumber || '')}</span></div>
         ${p.realTitle ? `<div class="mt-1"><b>Tên patent (lấy từ nguồn thật):</b> ${escHtml(p.realTitle)}</div>` : ''}
-        <div class="mt-1"><b>Người nộp:</b> ${p.applicant ? escHtml(p.applicant) : '<i class="text-3">(không xác định được)</i>'}${
+        <div class="mt-1"><b>Người nộp:</b> ${
+          p.applicant ? escHtml(p.applicant)
+            : p.viaHint || p.verifyStatus === 'unverified'
+              // Nêu rõ nguyên nhân thay vì chỉ "(không xác định được)" — người dùng cần biết đây là
+              // sự cố truy cập tạm thời, không phải patent thiếu thông tin chủ sở hữu.
+              ? '<i class="text-3">(chưa lấy được — Google Patents đang chặn tạm, không mở được trang patent)</i>'
+              : '<i class="text-3">(không xác định được)</i>'
+        }${
           p.applicantNote ? ` <span class="text-3" style="font-size:.72rem">(${escHtml(p.applicantNote)})</span>` : ''
         }${
           // Nêu rõ căn cứ đối chiếu chủ sở hữu — không im lặng để người dùng tưởng đã kiểm chắc.
