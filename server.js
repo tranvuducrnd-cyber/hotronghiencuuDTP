@@ -90,7 +90,9 @@ app.post('/api/admin/invite-user', requireApprovedUser, requireAdmin, async (req
   }
 });
 
-app.use(express.json({ limit: '10mb' }));
+// 30mb: file Excel công bố giá thuốc nặng tới ~11MB, mã hoá base64 để gửi lên phình thêm ~33%
+// (≈15MB) nên mức 10mb cũ sẽ chặn mất file thật.
+app.use(express.json({ limit: '30mb' }));
 app.use((req, res, next) => {
   if (req.method === 'POST') {
     console.log(`[REQUEST] ${req.method} ${req.url} - body:`, JSON.stringify(redactSecrets(req.body)).substring(0, 300));
@@ -698,6 +700,469 @@ app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
     console.error('[Validate] Error:', err.message);
     return res.json({ valid: true, warning: 'Không thể xác minh tên hoạt chất, tiếp tục tìm kiếm.' });
   }
+});
+
+// ── Tra cứu giá thuốc Việt Nam (giá kê khai / giá trúng thầu) ─────────────────
+// Nguồn dữ liệu: file công bố chính thức do quản trị viên tải lên. KHÔNG lấy trực tiếp từ cổng
+// web cơ quan quản lý vì đã kiểm và thấy chúng không dùng được: congkhaiyte.moh.gov.vn chuyển
+// hướng sang HTTPS nhưng cổng 443 từ chối kết nối, drugbank.vn không phân giải được tên miền.
+
+const PRICE_TABLES = { thau: 'drug_tender_prices', kekhai: 'drug_declared_prices' };
+
+// ── Giá kê khai: tra TRỰC TIẾP từ API Cục Quản lý Dược theo từ khoá ───────────
+// Vì sao không nạp sẵn toàn bộ 39.181 bản ghi: đã thử 2 lần và đều hỏng giữa chừng (bản ghi
+// 17.500 và 18.000) do máy chủ của Cục trả 504 khi phải lật trang sâu (skipCount lớn). Tra theo
+// TỪ KHOÁ thì tập kết quả nhỏ (vài trăm bản ghi), không cần lật sâu, và cũng nhẹ cho cổng của họ.
+// Kết quả được lưu đệm vào Supabase để lần sau tra lại là có ngay, kể cả khi cổng của Cục lỗi.
+const DAV_PRICE_API = 'https://dichvucong.dav.gov.vn/api/services/app/quanLyGiaThuoc/GetListCongBoPublicPaging';
+
+async function fetchDeclaredPricesFromDav(keyword) {
+  const PAGE = 200;          // trang nhỏ để máy chủ của Cục dễ trả lời
+  const MAX_PAGES = 15;      // đủ cho 3.000 bản ghi/từ khoá
+  const out = [];
+  for (let page = 0; page < MAX_PAGES; page++) {
+    let res = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        // Tham số BẮT BUỘC lồng trong "CongBoGiaThuoc" — gửi phẳng thì API vẫn báo thành công
+        // nhưng trả về 0 bản ghi (đã mất công mới tìm ra).
+        const r = await axios.post(DAV_PRICE_API,
+          { skipCount: page * PAGE, maxResultCount: PAGE, filterAll: keyword, CongBoGiaThuoc: {} },
+          { timeout: 90000, headers: { 'Content-Type': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' } });
+        res = r.data && r.data.result;
+        break;
+      } catch (e) {
+        if (attempt === 3) throw new Error(`Cổng Cục Quản lý Dược không phản hồi (${e.response?.status || e.code || e.message}).`);
+        await delay(3000 * attempt);
+      }
+    }
+    const items = (res && res.items) || [];
+    out.push(...items);
+    if (items.length < PAGE || out.length >= (res.totalCount || 0)) break;
+    await delay(800);
+  }
+  const txt = (v) => (v == null ? '' : String(v).replace(/\s+/g, ' ').trim());
+  const num = (v) => { const n = Number(String(v ?? '').replace(/[^\d.-]/g, '')); return Number.isFinite(n) && n !== 0 ? n : null; };
+  return out.filter((it) => txt(it.tenThuoc)).map((it) => ({
+    ten_thuoc: txt(it.tenThuoc),
+    hoat_chat: txt(it.hoatChat),
+    ham_luong: txt(it.hamLuong),
+    so_dang_ky: txt(it.soDangKy),
+    duong_dung: '',
+    dang_bao_che: txt(it.dangBaoChe),
+    nha_san_xuat: txt(it.doanhNghiepSanXuat),
+    nuoc_san_xuat: txt(it.nuocSanXuat),
+    quy_cach: txt(it.quyCachDongGoi),
+    don_vi_tinh: txt(it.donViTinh),
+    so_luong: null,                       // hồ sơ kê khai giá không có số lượng
+    don_gia: num(it.giaBanBuon) ?? num(it.giaBanBuonDuKien),
+    thanh_tien: null,
+    nguon_file: `DAV kê khai giá${it.donViKeKhai ? ' — ' + txt(it.donViKeKhai) : ''}`,
+  }));
+}
+
+// Đọc file Excel công bố → danh sách dòng đã chuẩn hoá.
+// Dò tiêu đề ĐỘNG thay vì cố định vị trí/tên cột: file thật có 2-3 dòng tiêu đề văn bản ở đầu
+// (Phụ lục 3, ghi chú...), và tên cột đổi giữa các năm — vd 2022 ghi "Tên hoạt chất/thành phần
+// dược liệu" còn 2023/2024 ghi "Tên hoạt chất/thành phần".
+function parsePriceWorkbook(buf) {
+  const X = require('xlsx');
+  const wb = X.read(buf, { type: 'buffer' });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  if (!ws) throw new Error('File không có sheet dữ liệu nào.');
+  const raw = X.utils.sheet_to_json(ws, { header: 1, defval: '', blankrows: false });
+
+  const headerIdx = raw.findIndex((r) => r.some((c) => /tên\s*thuốc/i.test(String(c || ''))));
+  if (headerIdx < 0) throw new Error('Không tìm thấy dòng tiêu đề (phải có cột "Tên thuốc"). File có đúng là bảng công bố giá không?');
+  const header = raw[headerIdx].map((c) => String(c || '').replace(/\s+/g, ' ').trim());
+
+  const col = (...keywords) => header.findIndex((h) => {
+    const low = h.toLowerCase();
+    return keywords.some((k) => low.includes(k));
+  });
+  const idx = {
+    tenThuoc:    col('tên thuốc'),
+    hoatChat:    col('hoạt chất', 'thành phần'),
+    hamLuong:    col('nđ/hl', 'nồng độ', 'hàm lượng'),
+    soDangKy:    col('sđk', 'gpnk', 'số đăng ký'),
+    duongDung:   col('đường dùng'),
+    dangBaoChe:  col('dạng bào chế'),
+    nhaSanXuat:  col('sở sản xuất', 'nhà sản xuất', 'cơ sở sx'),
+    nuocSanXuat: col('nước sản xuất'),
+    quyCach:     col('quy cách'),
+    donViTinh:   col('đvt', 'đơn vị tính'),
+    soLuong:     col('số lượng'),
+    donGia:      col('đơn giá', 'giá kê khai', 'giá bán'),
+    thanhTien:   col('thành tiền'),
+  };
+  if (idx.tenThuoc < 0 || idx.donGia < 0) {
+    throw new Error(`Thiếu cột bắt buộc. Đọc được các cột: ${header.filter(Boolean).join(' | ')}`);
+  }
+
+  const get = (row, i) => (i >= 0 && row[i] != null ? row[i] : '');
+  const toNum = (v) => {
+    if (typeof v === 'number') return v;
+    const n = Number(String(v).replace(/[^\d.-]/g, ''));
+    return Number.isFinite(n) ? n : null;
+  };
+
+  const rows = [];
+  for (let i = headerIdx + 1; i < raw.length; i++) {
+    const r = raw[i];
+    const ten = String(get(r, idx.tenThuoc) || '').trim();
+    if (!ten) continue;                    // bỏ dòng trống / dòng tổng cộng cuối bảng
+    if (/^tt$/i.test(ten)) continue;       // bỏ dòng tiêu đề lặp lại giữa file
+    rows.push({
+      ten_thuoc: ten,
+      hoat_chat: String(get(r, idx.hoatChat) || '').trim(),
+      ham_luong: String(get(r, idx.hamLuong) || '').trim(),
+      so_dang_ky: String(get(r, idx.soDangKy) || '').trim(),
+      duong_dung: String(get(r, idx.duongDung) || '').trim(),
+      dang_bao_che: String(get(r, idx.dangBaoChe) || '').trim(),
+      nha_san_xuat: String(get(r, idx.nhaSanXuat) || '').trim(),
+      nuoc_san_xuat: String(get(r, idx.nuocSanXuat) || '').trim(),
+      quy_cach: String(get(r, idx.quyCach) || '').trim(),
+      don_vi_tinh: String(get(r, idx.donViTinh) || '').trim(),
+      so_luong: toNum(get(r, idx.soLuong)),
+      don_gia: toNum(get(r, idx.donGia)),
+      thanh_tien: toNum(get(r, idx.thanhTien)),
+    });
+  }
+  return { rows, header: header.filter(Boolean), sheetName: wb.SheetNames[0] };
+}
+
+// Tách từ khoá người dùng thành nhiều hoạt chất để tra THUỐC PHỐI HỢP.
+// Dữ liệu thật ghi thuốc phối hợp theo nhiều kiểu và THỨ TỰ KHÔNG CỐ ĐỊNH:
+//   "Codein phosphat 30mg; Paracetamol 500mg"  (paracetamol đứng sau)
+//   "Losartan potassium + Hydrochlorothiazide"
+// nên phải tìm theo kiểu "chứa TẤT CẢ các hoạt chất", không so khớp nguyên cụm.
+function splitDrugKeywords(q) {
+  return String(q || '')
+    .split(/[+;,/&]|\s+và\s+/i)          // ngăn cách bằng + ; , / & hoặc chữ "và"
+    .map((s) => s.replace(/[%]/g, ' ').trim())
+    .filter((s) => s.length >= 2)
+    .slice(0, 5);                         // tối đa 5 hoạt chất, đủ cho mọi thuốc phối hợp thực tế
+}
+
+// Gắn điều kiện tìm vào truy vấn: mỗi từ khoá là một điều kiện (tên thuốc HOẶC hoạt chất),
+// các điều kiện nối với nhau bằng VÀ — đã kiểm PostgREST nối nhiều .or() đúng theo nghĩa VÀ.
+function applyDrugKeywordFilter(query, keywords) {
+  keywords.forEach((kw) => {
+    query = query.or(`ten_thuoc.ilike.%${kw}%,hoat_chat.ilike.%${kw}%`);
+  });
+  return query;
+}
+
+function priceTableOf(type) {
+  const t = PRICE_TABLES[type];
+  if (!t) throw new Error('Loại dữ liệu giá không hợp lệ (chỉ nhận "thau" hoặc "kekhai").');
+  return t;
+}
+
+// Thông tin dữ liệu đang có: file nguồn, số dòng, thời điểm nạp — để người dùng biết độ mới.
+app.post('/api/price/meta', requireApprovedUser, async (req, res) => {
+  try {
+    const table = priceTableOf(req.body.type);
+    const { count, error } = await supabaseAdmin.from(table).select('*', { count: 'exact', head: true });
+    if (error) throw new Error(error.message);
+    if (!count) return res.json({ rowCount: 0 });
+    // Liệt kê ĐỦ các file nguồn đã nạp, không chỉ file mới nhất — dữ liệu thường gồm nhiều đợt
+    // công bố (vd KQTT 2022 + 2023 + 2024), người dùng cần biết mình đang tra trên những đợt nào.
+    // Lấy mẫu RẢI ĐỀU khắp bảng thay vì chỉ đọc phần cuối: các file được nạp lần lượt nên 2000
+    // dòng mới nhất đều thuộc cùng một file, khiến 2 file nạp trước bị bỏ sót. Mỗi file chiếm
+    // ít nhất ~16% số dòng nên 16 điểm mẫu chắc chắn chạm tới cả ba.
+    // Chạy SONG SONG: 16 truy vấn tuần tự mất tới 4,3 giây, đủ lâu để người dùng thấy thông tin
+    // của tab trước đó và tưởng là chưa có dữ liệu. Song song thì chỉ còn ~1 lượt đi-về.
+    const PROBES = 16;
+    const probes = await Promise.all(
+      Array.from({ length: PROBES }, (_, i) => {
+        const offset = Math.floor((count - 1) * (i / (PROBES - 1)));
+        return supabaseAdmin.from(table)
+          .select('nguon_file, created_at').order('id', { ascending: true }).range(offset, offset);
+      }),
+    );
+    const seen = new Map();
+    probes.forEach(({ data: one }) => {
+      const r = (one || [])[0];
+      if (r && r.nguon_file && !seen.has(r.nguon_file)) seen.set(r.nguon_file, r.created_at);
+    });
+    const sources = Array.from(seen, ([nguon_file, created_at]) => ({ nguon_file, created_at }));
+    const newest = sources.reduce((a, b) => (!a || (b.created_at > a.created_at) ? b : a), null) || {};
+    res.json({
+      rowCount: count,
+      fileName: sources.map((s) => s.nguon_file).join(' · ') || '(không rõ)',
+      uploadedAt: newest.created_at ? new Date(newest.created_at).toLocaleString('vi-VN') : '',
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Tra cứu: tìm theo tên thuốc HOẶC tên hoạt chất, sắp theo đơn giá tăng dần để dễ so sánh.
+app.post('/api/price/search', requireApprovedUser, async (req, res) => {
+  try {
+    const table = priceTableOf(req.body.type);
+    const q = String(req.body.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Thiếu từ khoá tra cứu.' });
+
+    // Giá kê khai: lấy trực tiếp từ cổng Cục Quản lý Dược rồi lưu đệm lại. Nếu cổng lỗi/quá tải
+    // thì rơi xuống dùng bản đệm đã lưu, kèm ghi chú rõ để người dùng biết dữ liệu có thể cũ.
+    let davNote = '';
+    if (req.body.type === 'kekhai') {
+      // Kho đã có ~37.400 bản kê khai. Nếu tra thấy sẵn thì KHÔNG gọi cổng Cục nữa — gọi mỗi lần
+      // khiến tra cứu mất 30-95 giây dù dữ liệu đã nằm sẵn trong kho. Chỉ gọi khi kho không có,
+      // tức thuốc chưa từng được nạp.
+      const kwCheck = splitDrugKeywords(q);
+      let checkQuery = supabaseAdmin.from(table).select('id', { count: 'exact', head: true });
+      checkQuery = applyDrugKeywordFilter(checkQuery, kwCheck);
+      const { count: daCoTrongKho } = await checkQuery;
+      if (daCoTrongKho > 0) {
+        davNote = `Từ kho dữ liệu đã nạp (${Number(daCoTrongKho).toLocaleString('vi-VN')} bản kê khai khớp).`;
+      } else try {
+        // Cổng của Cục KHÔNG hiểu cú pháp nhiều hoạt chất ("paracetamol + codein" sẽ trả 0).
+        // Nên chỉ gửi MỘT từ khoá (chọn từ dài nhất cho ít kết quả rác nhất) để lấy về tập lớn,
+        // rồi để truy vấn Supabase bên dưới lọc tiếp theo đủ các hoạt chất còn lại.
+        const kws = splitDrugKeywords(q);
+        const kwChinh = kws.slice().sort((a, b) => b.length - a.length)[0] || q;
+        const fresh = await fetchDeclaredPricesFromDav(kwChinh);
+        if (fresh.length) {
+          // Xoá bản đệm cũ của đúng từ khoá này rồi ghi bản mới (tránh trùng lặp dồn theo thời gian)
+          const soDK = fresh.map((r) => r.so_dang_ky).filter(Boolean);
+          if (soDK.length) await supabaseAdmin.from(table).delete().in('so_dang_ky', soDK);
+          for (let i = 0; i < fresh.length; i += 1000) {
+            await supabaseAdmin.from(table).insert(fresh.slice(i, i + 1000));
+          }
+          davNote = `Lấy trực tiếp từ Cục Quản lý Dược lúc ${new Date().toLocaleString('vi-VN')}`;
+        }
+      } catch (e) {
+        console.warn('[Price] Không lấy được giá kê khai trực tiếp, dùng bản đệm:', e.message);
+        davNote = `⚠️ ${e.message} Đang hiển thị dữ liệu đã lưu trước đó (có thể chưa mới nhất).`;
+      }
+    }
+
+    // Trả TOÀN BỘ dòng khớp. Trần 20.000 chỉ để chặn truy vấn quá rộng làm treo trình duyệt —
+    // gõ 1 chữ cái "a" khớp tới 175.667 dòng. Tra thuốc bình thường chỉ 500-15.000 dòng.
+    const MAX_ROWS = 20000;
+    const PAGE = 1000; // Supabase mỗi lượt trả tối đa 1.000 dòng nên phải lấy nhiều lượt
+    const keywords = splitDrugKeywords(q);
+    const form = String(req.body.dosageForm || '').replace(/[%,]/g, ' ').trim();
+    // Lọc theo dạng bào chế khớp MỘT PHẦN: gõ "viên nang" vẫn ra cả "Viên nang cứng"/"mềm"
+    // (dữ liệu thật có trên 228 cách ghi dạng bào chế khác nhau).
+    const buildQuery = () => {
+      let qb = supabaseAdmin.from(table)
+        .select('ten_thuoc,hoat_chat,ham_luong,dang_bao_che,duong_dung,quy_cach,don_vi_tinh,don_gia,so_luong,nha_san_xuat,nuoc_san_xuat,so_dang_ky,nguon_file');
+      qb = applyDrugKeywordFilter(qb, keywords);
+      if (form) qb = qb.ilike('dang_bao_che', `%${form}%`);
+      return qb;
+    };
+
+    const data = [];
+    for (let from = 0; from < MAX_ROWS; from += PAGE) {
+      const { data: page, error } = await buildQuery()
+        .order('don_gia', { ascending: true })
+        .order('id', { ascending: true })   // khoá phụ để phân trang không bị lặp/sót dòng cùng giá
+        .range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      if (!page || !page.length) break;
+      data.push(...page);
+      if (page.length < PAGE) break;
+    }
+
+    const columns = ['Tên thuốc', 'Hoạt chất', 'Nồng độ/Hàm lượng', 'Dạng bào chế', 'Đường dùng',
+      'Quy cách', 'ĐVT', 'Đơn giá (VNĐ)', 'Số lượng', 'Cơ sở sản xuất', 'Nước SX', 'SĐK/GPNK', 'Nguồn'];
+    const fmt = (n) => (n == null ? '' : Number(n).toLocaleString('vi-VN'));
+    const rows = (data || []).map((r) => [
+      r.ten_thuoc, r.hoat_chat, r.ham_luong, r.dang_bao_che, r.duong_dung, r.quy_cach,
+      r.don_vi_tinh, fmt(r.don_gia), fmt(r.so_luong), r.nha_san_xuat, r.nuoc_san_xuat,
+      r.so_dang_ky, r.nguon_file,
+    ]);
+    res.json({ columns, rows, truncated: rows.length >= MAX_ROWS, davNote });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Thống kê + nhận xét giá. QUAN TRỌNG: mọi CON SỐ đều do code tính trên TOÀN BỘ dòng khớp
+// (không phải 300 dòng hiển thị — danh sách đó đã sắp theo giá tăng dần nên "giá cao nhất" lấy
+// từ đó sẽ sai). AI chỉ được NHẬN XÉT dựa trên số đã tính sẵn, không tự sinh số.
+app.post('/api/price/summary', requireApprovedUser, async (req, res) => {
+  try {
+    const table = priceTableOf(req.body.type);
+    const q = String(req.body.q || '').trim();
+    if (!q) return res.status(400).json({ error: 'Thiếu từ khoá.' });
+    const form = String(req.body.dosageForm || '').replace(/[%,]/g, ' ').trim();
+
+    // Cùng trần với phần tra cứu để thống kê phủ đúng tập dòng đang hiển thị.
+    const CAP = 20000;
+    const PAGE = 1000;
+    const buildQuery = () => {
+      let qb = supabaseAdmin.from(table)
+        .select('ten_thuoc,hoat_chat,ham_luong,dang_bao_che,don_vi_tinh,don_gia,nha_san_xuat,nuoc_san_xuat,so_luong,thanh_tien,nguon_file');
+      qb = applyDrugKeywordFilter(qb, splitDrugKeywords(q));
+      if (form) qb = qb.ilike('dang_bao_che', `%${form}%`);
+      return qb;
+    };
+    const data = [];
+    for (let from = 0; from < CAP; from += PAGE) {
+      const { data: page, error } = await buildQuery()
+        .order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      if (!page || !page.length) break;
+      data.push(...page);
+      if (page.length < PAGE) break;
+    }
+
+    const rows = (data || []).filter((r) => Number(r.don_gia) > 0);
+    if (!rows.length) return res.json({ stats: null, comment: '' });
+
+    const byPrice = [...rows].sort((a, b) => a.don_gia - b.don_gia);
+    const cheapest = byPrice[0];
+    const priciest = byPrice[byPrice.length - 1];
+    const median = byPrice[Math.floor(byPrice.length / 2)];
+
+    // "Giá phổ biến nhất": gom theo mức giá làm tròn để tránh mỗi dòng một giá lẻ thành ra không
+    // mức nào lặp lại. Làm tròn theo bậc tuỳ độ lớn để nhóm cho hợp lý.
+    const roundTo = (v) => (v < 1000 ? Math.round(v / 50) * 50 : v < 100000 ? Math.round(v / 500) * 500 : Math.round(v / 10000) * 10000);
+    const freq = new Map();
+    rows.forEach((r) => { const k = roundTo(r.don_gia); freq.set(k, (freq.get(k) || 0) + 1); });
+    const [modePrice, modeCount] = [...freq.entries()].sort((a, b) => b[1] - a[1])[0];
+
+    const mfg = new Map();
+    rows.forEach((r) => { const k = (r.nha_san_xuat || '(không rõ)').trim(); mfg.set(k, (mfg.get(k) || 0) + 1); });
+    const topMfg = [...mfg.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      .map(([ten, soLuot]) => ({ ten, soLuot }));
+
+    const pick = (r) => ({
+      tenThuoc: r.ten_thuoc, hoatChat: r.hoat_chat, hamLuong: r.ham_luong,
+      dangBaoChe: r.dang_bao_che, donViTinh: r.don_vi_tinh,
+      nhaSanXuat: r.nha_san_xuat, nuocSanXuat: r.nuoc_san_xuat, donGia: r.don_gia,
+    });
+    // TOP 10 sản phẩm theo TỔNG LƯỢNG trúng thầu, cộng gộp cả 3 năm dữ liệu.
+    // Gộp theo (tên thuốc + hàm lượng + nhà sản xuất): cùng một tên thuốc nhưng khác hàm lượng
+    // hoặc khác hãng là hai sản phẩm khác nhau, gộp chung sẽ ra con số vô nghĩa.
+    const sp = new Map();
+    rows.forEach((r) => {
+      const key = [r.ten_thuoc, r.ham_luong, r.nha_san_xuat].map((x) => (x || '').trim()).join(' | ');
+      if (!sp.has(key)) {
+        sp.set(key, {
+          tenThuoc: r.ten_thuoc, hamLuong: r.ham_luong, dangBaoChe: r.dang_bao_che,
+          nhaSanXuat: r.nha_san_xuat, nuocSanXuat: r.nuoc_san_xuat, donViTinh: r.don_vi_tinh,
+          tongLuong: 0, tongTien: 0, soLuot: 0, giaMin: Infinity, giaMax: 0, nam: new Set(),
+        });
+      }
+      const g = sp.get(key);
+      g.tongLuong += Number(r.so_luong) || 0;
+      g.tongTien += Number(r.thanh_tien) || 0;
+      g.soLuot += 1;
+      const gia = Number(r.don_gia) || 0;
+      if (gia > 0) { g.giaMin = Math.min(g.giaMin, gia); g.giaMax = Math.max(g.giaMax, gia); }
+      const y = String(r.nguon_file || '').match(/20\d{2}/);   // "…KQTT năm 2022" → 2022
+      if (y) g.nam.add(y[0]);
+    });
+    // Dữ liệu KÊ KHAI không có cột số lượng (chỉ là hồ sơ kê khai giá, không phải kết quả đấu
+    // thầu) → xếp theo sản lượng sẽ ra một bảng toàn số 0, gây hiểu nhầm. Với kê khai thì xếp
+    // theo SỐ MẶT HÀNG mà đơn vị đó kê khai.
+    const laKeKhai = req.body.type === 'kekhai';
+    const topSanPham = [...sp.values()]
+      .sort((a, b) => (laKeKhai ? b.soLuot - a.soLuot : b.tongLuong - a.tongLuong))
+      .slice(0, 10)
+      .map((g) => Object.assign({}, g, {
+        giaMin: g.giaMin === Infinity ? null : g.giaMin,
+        nam: [...g.nam].sort().join(', '),
+      }));
+
+    const stats = {
+      soDong: rows.length,
+      laKeKhai,          // client dùng để đổi nhãn và ẩn các cột không có dữ liệu
+      topSanPham,
+      dayDu: rows.length < CAP,       // false = đã chạm trần, thống kê chỉ trên mẫu
+      reNhat: pick(cheapest),
+      datNhat: pick(priciest),
+      trungVi: median.don_gia,
+      giaPhoBien: modePrice,
+      soLuotGiaPhoBien: modeCount,
+      chenhLech: cheapest.don_gia > 0 ? +(priciest.don_gia / cheapest.don_gia).toFixed(1) : null,
+      topNhaSanXuat: topMfg,
+    };
+
+    // AI chỉ diễn giải — nhấn mạnh cấm bịa số.
+    const vnd = (n) => Number(n).toLocaleString('vi-VN') + ' đồng';
+    let comment = '';
+    try {
+      const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+      const text = await callOpenAI(openaiKey, [
+        {
+          role: 'system',
+          content: `Bạn là chuyên gia phân tích giá thuốc, viết cho người làm nghiên cứu phát triển thuốc generic tại Việt Nam.
+Bạn được cho SỐ LIỆU ĐÃ TÍNH SẴN từ ${laKeKhai
+  ? 'dữ liệu GIÁ KÊ KHAI do doanh nghiệp kê khai với Cục Quản lý Dược (giá bán buôn dự kiến)'
+  : 'dữ liệu KẾT QUẢ TRÚNG THẦU thật tại các cơ sở y tế'}. Hãy viết nhận xét ngắn gọn 4-6 câu.
+TUYỆT ĐỐI KHÔNG được tạo ra bất kỳ con số nào khác ngoài các số đã cho. Không suy đoán, không thêm thuốc/hãng không có trong dữ liệu.
+${laKeKhai
+  ? 'Đây là giá KÊ KHAI, KHÔNG phải giá trúng thầu — TUYỆT ĐỐI không dùng các từ "trúng thầu", "sản lượng", "lượt trúng thầu". Dữ liệu này KHÔNG có số lượng bán ra. Tập trung vào: khoảng giá kê khai, mặt bằng giá phổ biến, các đơn vị kê khai nhiều mặt hàng nhất, và ý nghĩa với việc định giá thuốc generic.'
+  : 'Tập trung vào: mức chênh lệch giá và ý nghĩa của nó với cơ hội làm generic; mặt bằng giá phổ biến; hãng nào áp đảo về số lượt trúng thầu.'}
+Viết tiếng Việt tự nhiên, KHÔNG dùng dấu * hay #, không xuống dòng bằng gạch đầu dòng.`,
+        },
+        // Gửi số KÈM SẴN ĐƠN VỊ bằng chữ, KHÔNG gửi JSON thô: đã gặp lỗi thật khi gửi JSON —
+        // AI thấy trường "chenhLech: 48" rồi viết thành "chênh lệch 48%", trong khi thực tế là
+        // 48 LẦN (550đ so với 26.422đ). Ghi rõ đơn vị ngay trong câu là cách chắc chắn nhất.
+        {
+          role: 'user',
+          content: [
+            `Tra cứu: "${q}"${form ? `, lọc dạng bào chế "${form}"` : ''}.`,
+            laKeKhai
+              ? `Tổng số bản kê khai giá xét đến: ${stats.soDong.toLocaleString('vi-VN')} bản.`
+              : `Tổng số lượt trúng thầu xét đến: ${stats.soDong.toLocaleString('vi-VN')} lượt.`,
+            `Giá THẤP NHẤT: ${vnd(stats.reNhat.donGia)} một ${stats.reNhat.donViTinh || 'đơn vị'} — thuốc "${stats.reNhat.tenThuoc}" ${stats.reNhat.hamLuong || ''}, do ${stats.reNhat.nhaSanXuat || 'không rõ'} (${stats.reNhat.nuocSanXuat || 'không rõ nước'}) sản xuất.`,
+            `Giá CAO NHẤT: ${vnd(stats.datNhat.donGia)} một ${stats.datNhat.donViTinh || 'đơn vị'} — thuốc "${stats.datNhat.tenThuoc}" ${stats.datNhat.hamLuong || ''}, do ${stats.datNhat.nhaSanXuat || 'không rõ'} (${stats.datNhat.nuocSanXuat || 'không rõ nước'}) sản xuất.`,
+            `Giá cao nhất gấp ${stats.chenhLech} LẦN giá thấp nhất (đây là SỐ LẦN, không phải phần trăm).`,
+            `Giá trung vị: ${vnd(stats.trungVi)} một đơn vị.`,
+            `Mức giá phổ biến nhất: khoảng ${vnd(stats.giaPhoBien)} một đơn vị, có ${stats.soLuotGiaPhoBien.toLocaleString('vi-VN')} ${laKeKhai ? 'bản kê khai' : 'lượt trúng thầu'} quanh mức này.`,
+            `Các hãng xuất hiện nhiều nhất: ${stats.topNhaSanXuat.map((m) => `${m.ten} (${m.soLuot} ${laKeKhai ? 'mặt hàng' : 'lượt'})`).join('; ')}.`,
+            '',
+            laKeKhai
+              ? 'TOP 10 MẶT HÀNG ĐƯỢC KÊ KHAI NHIỀU LẦN NHẤT:'
+              : 'TOP 10 SẢN PHẨM THEO TỔNG LƯỢNG TRÚNG THẦU (cộng gộp cả 3 năm 2022-2024):',
+            ...stats.topSanPham.map((g, i) => (laKeKhai
+              ? `${i + 1}. ${g.tenThuoc}${g.hamLuong ? ' ' + g.hamLuong : ''} — ${g.nhaSanXuat || 'không rõ hãng'}: ${g.soLuot} bản kê khai, giá từ ${vnd(g.giaMin)} đến ${vnd(g.giaMax)} một ${g.donViTinh || 'đơn vị'}.`
+              : `${i + 1}. ${g.tenThuoc}${g.hamLuong ? ' ' + g.hamLuong : ''} — ${g.nhaSanXuat || 'không rõ hãng'}: tổng ${Number(g.tongLuong).toLocaleString('vi-VN')} ${g.donViTinh || 'đơn vị'}, thành tiền ${vnd(Math.round(g.tongTien))}, qua ${g.soLuot} lượt trúng thầu, giá từ ${vnd(g.giaMin)} đến ${vnd(g.giaMax)}.`)),
+            '',
+            laKeKhai
+              ? 'Trong nhận xét, hãy nêu khoảng giá kê khai và các đơn vị kê khai nổi bật. NHẮC LẠI: dữ liệu này KHÔNG có sản lượng, không được nói về lượng bán hay trúng thầu.'
+              : 'Trong nhận xét, hãy nêu bật 2-3 sản phẩm dẫn đầu về sản lượng và ý nghĩa của nó (nhu cầu thị trường lớn = cơ hội cho generic).',
+          ].join('\n'),
+        },
+      ], 'google/gemini-2.5-flash-lite', 2, 900);
+      comment = String(text || '').trim();
+    } catch (e) {
+      console.warn('[Price] Nhận xét AI lỗi (vẫn trả thống kê):', e.message);
+    }
+
+    res.json({ stats, comment });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Tải file công bố lên (CHỈ quản trị viên) — thay toàn bộ dữ liệu cũ của loại đó.
+// requireAdmin đọc req.profile do requireApprovedUser gán — phải đặt sau, nếu không thì
+// req.profile luôn rỗng và ngay cả admin thật cũng bị chặn.
+app.post('/api/price/upload', requireApprovedUser, requireAdmin, async (req, res) => {
+  try {
+    const table = priceTableOf(req.body.type);
+    const fileName = String(req.body.fileName || 'không rõ').slice(0, 200);
+    if (!req.body.contentBase64) return res.status(400).json({ error: 'Thiếu nội dung file.' });
+    const buf = Buffer.from(req.body.contentBase64, 'base64');
+    const { rows } = parsePriceWorkbook(buf);
+    if (!rows.length) return res.status(400).json({ error: 'File không có dòng dữ liệu nào đọc được.' });
+
+    // Chèn theo lô — 193.000 dòng mà đẩy 1 lần sẽ vượt giới hạn kích thước request của Supabase.
+    const CHUNK = 1000;
+    let inserted = 0;
+    for (let i = 0; i < rows.length; i += CHUNK) {
+      const chunk = rows.slice(i, i + CHUNK).map((r) => Object.assign({}, r, { nguon_file: fileName }));
+      const { error } = await supabaseAdmin.from(table).insert(chunk);
+      if (error) throw new Error(`Lỗi khi ghi dòng ${i}: ${error.message}`);
+      inserted += chunk.length;
+    }
+    console.log(`[Price] Đã nạp ${inserted} dòng từ "${fileName}" vào ${table}.`);
+    res.json({ rowCount: inserted, fileName });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ── Route: ChEMBL Properties ──────────────────────────────────────────────────
@@ -2342,7 +2807,80 @@ async function findCandidatesViaAI(drugName, dosageFormVi, openaiKey) {
 //   rejected   — patent tồn tại nhưng KHÔNG nhắc hoạt chất, hoặc 404 (bằng chứng patent sai).
 //   unverified — không tải được (503/timeout) — CHƯA CHỨNG MINH ĐƯỢC GÌ, vẫn giữ lại và gắn nhãn
 //                cảnh báo thay vì âm thầm loại bỏ.
-async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
+// Lấy trang patent QUA SERPER khi gọi thẳng bị Google chặn (503).
+// Serper tải trang từ hạ tầng của họ nên không dính lệnh chặn IP của mình — đây là cách duy nhất
+// còn lấy được TÊN CHỦ SỞ HỮU khi bị chặn (đã thử USPTO Assignment API, PatentsView, EPO OPS,
+// Espacenet, FreePatentsOnline — tất cả đều chặn hoặc đòi khoá đăng ký).
+// Serper chỉ trả VĂN BẢN THUẦN (không có HTML) nên phải đọc theo mốc chữ, không dùng được cheerio.
+// Đọc chủ sở hữu từ VĂN BẢN trang Google Patents.
+// Bố cục: "Current Assignee (…miễn trừ…) <CHỦ HIỆN TẠI> Original Assignee <CHỦ GỐC> Priority date"
+// Neo giữa 2 mốc cố định để KHÔNG dính chủ sở hữu của các patent trích dẫn ở phần dưới trang
+// (một trang có tới 46 mục assignee — lấy bừa là gán nhầm tên công ty khác).
+function docChuSoHuu_GooglePatents(text) {
+  const layGiua = (batDau, ketThuc) => {
+    const i = text.indexOf(batDau);
+    if (i < 0) return '';
+    const from = i + batDau.length;
+    const j = text.indexOf(ketThuc, from);
+    return (j < 0 ? text.slice(from, from + 200) : text.slice(from, j)).replace(/\s+/g, ' ').trim();
+  };
+  const hienTai = layGiua('accuracy of the list.)', 'Original Assignee');
+  const goc = layGiua('Original Assignee', 'Priority date');
+  return [hienTai, goc].filter(Boolean).filter((s, i, a) => a.indexOf(s) === i).join(' · ').slice(0, 200);
+}
+
+// PatentGuru ghi thẳng "Assignee: <tên>" nên đọc đơn giản hơn nhiều.
+function docChuSoHuu_PatentGuru(text) {
+  const m = text.match(/Assignee[s]?:\s*([^\n]{3,160}?)(?:\s+Inventors?:|\s+Applicant|\n|$)/i);
+  return m ? m[1].replace(/\s+/g, ' ').trim().slice(0, 200) : '';
+}
+
+// Các nguồn thử lần lượt. Mỗi nguồn đều LỖI NGẪU NHIÊN (Serper trả 500 "Scraping failed" không
+// theo quy luật), nên phải vừa thử lại vừa đổi nguồn thì mới gần như luôn lấy được tên người nộp.
+const NGUON_PATENT = [
+  { ten: 'Google Patents', url: (id) => `https://patents.google.com/patent/${id}/en`, doc: docChuSoHuu_GooglePatents },
+  { ten: 'PatentGuru', url: (id) => `https://www.patentguru.com/${id}`, doc: docChuSoHuu_PatentGuru },
+];
+
+// Ngân sách thời gian dùng chung cho MỘT lượt tra cứu. Không có nó thì tổng thời gian phình
+// không kiểm soát (20 patent x 2 nguồn x 3 lần thử x 90s) và server ngắt kết nối ở phút thứ 5.
+let _serperDeadline = 0;
+function batDauNganSachSerper(giay) { _serperDeadline = Date.now() + giay * 1000; }
+function conNganSach() { return Date.now() < _serperDeadline; }
+
+async function fetchPatentViaSerper(patentId, serperKey) {
+  if (!serperKey || !conNganSach()) return null;
+  const goiSerper = async (url) => {
+    const r = await axios.post('https://scrape.serper.dev', { url },
+      { headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' }, timeout: 30000 });
+    return (r.data && r.data.text) || '';
+  };
+
+  let vanBanGoogle = '';
+  for (const nguon of NGUON_PATENT) {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (!conNganSach()) break;
+      try {
+        const t = await goiSerper(nguon.url(patentId));
+        if (t.length < 300) throw new Error('nội dung quá ngắn');
+        if (nguon.ten === 'Google Patents') vanBanGoogle = t;   // giữ để đối chiếu tên hoạt chất
+        const applicant = nguon.doc(t);
+        if (applicant) {
+          return { text: vanBanGoogle || t, applicant, nguon: nguon.ten };
+        }
+        break;   // lấy được trang nhưng không có chủ sở hữu → đổi nguồn, khỏi thử lại
+      } catch (e) {
+        if (attempt === 3) console.warn(`[Patent] ${nguon.ten} không lấy được ${patentId}: ${e.message}`);
+        else await delay(1500 * attempt);
+      }
+    }
+  }
+  // Không nguồn nào cho tên chủ sở hữu, nhưng nếu đã tải được trang Google thì vẫn dùng để đối chiếu
+  return vanBanGoogle ? { text: vanBanGoogle, applicant: '', nguon: 'Google Patents' } : null;
+}
+
+
+async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint, serperKey) {
   const id = normalizePatentId(patentNumber);
   // Chấp nhận MỌI cơ quan sáng chế: 2 chữ cái mã nước/khu vực + phần còn lại là chữ/số.
   // Bản cũ chỉ cho US|EP|WO|CA|CN nên đã loại oan hàng loạt patent CÓ THẬT của JP/KR/EA/CZ/MX —
@@ -2372,8 +2910,31 @@ async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
       });
       if (r.status === 503) {
         if (attempt < maxRetries - 1) { await delay(1500 * (attempt + 1)); continue; }
-        // Hết lượt thử mà vẫn 503: nếu có bằng chứng từ Serper thì tạm coi verified (nguồn độc
-        // lập đã xác nhận), không thì unverified — KHÔNG loại bỏ oan.
+
+        // Bị chặn: lấy trang QUA SERPER (tải hộ từ hạ tầng của họ, không dính lệnh chặn IP mình).
+        // Đây là cách duy nhất còn lấy được TÊN CHỦ SỞ HỮU khi Google chặn — không có nó thì thẻ
+        // patent chỉ hiện "chưa lấy được", mà thiếu người nộp thì kết quả gần như vô nghĩa.
+        try {
+          const viaSerper = await fetchPatentViaSerper(id, serperKey);
+          if (viaSerper) {
+            const body = viaSerper.text.toUpperCase();
+            if (drugUpper && !body.includes(drugUpper)) {
+              return { status: 'rejected', reason: `Nội dung patent không nhắc tới "${drugName}"` };
+            }
+            return {
+              status: 'verified',
+              realTitle: hint?.title || viaSerper.title || '',
+              realApplicant: viaSerper.applicant,
+              verifiedUrl: url,
+              viaSerper: true,
+            };
+          }
+        } catch (e) {
+          console.warn(`[Patent] Lấy qua Serper thất bại (${id}): ${e.message}`);
+        }
+
+        // Serper cũng không được: nếu có bằng chứng từ kết quả tìm kiếm thì tạm coi verified,
+        // không thì unverified — KHÔNG loại bỏ oan.
         return hintMatches
           ? { status: 'verified', realTitle: hint.title, verifiedUrl: url, viaHint: true }
           : { status: 'unverified', reason: 'Google Patents đang chặn tạm thời (503) — chưa đối chiếu được' };
@@ -2434,6 +2995,26 @@ async function verifyPatentAgainstGooglePatents(patentNumber, drugName, hint) {
       return { status: 'verified', realTitle: title, realApplicant, applicantNote, verifiedUrl: url };
     } catch (e) {
       if (attempt < maxRetries - 1) { await delay(1000); continue; }
+      // Lỗi mạng cũng thử lấy qua Serper — trước đây chỉ nhánh 503 mới thử, nên khi Google
+      // chặn bằng cách ngắt kết nối (thay vì trả 503) thì vẫn mất tên người nộp.
+      try {
+        const viaSerper = await fetchPatentViaSerper(id, serperKey);
+        if (viaSerper) {
+          const body = viaSerper.text.toUpperCase();
+          if (drugUpper && !body.includes(drugUpper)) {
+            return { status: 'rejected', reason: `Nội dung patent không nhắc tới "${drugName}"` };
+          }
+          return {
+            status: 'verified',
+            realTitle: hint?.title || viaSerper.title || '',
+            realApplicant: viaSerper.applicant,
+            verifiedUrl: url,
+            viaSerper: true,
+          };
+        }
+      } catch (e2) {
+        console.warn(`[Patent] Lấy qua Serper thất bại (${id}): ${e2.message}`);
+      }
       return hintMatches
         ? { status: 'verified', realTitle: hint.title, verifiedUrl: url, viaHint: true }
         : { status: 'unverified', reason: 'Không tải được trang patent để đối chiếu: ' + e.message };
@@ -2446,6 +3027,7 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
   const { drugName, dosageForm } = req.body;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
   const serperKey = req.body.serperKey || process.env.SERPER_API_KEY;
+  batDauNganSachSerper(420);   // 7 phút — đủ rộng vì các lượt gọi Serper chạy song song
   if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
 
@@ -2488,14 +3070,16 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
     // khiến Google Patents chặn tạm (503) ngay từ lô đầu, mọi patent rơi vào nhánh dự phòng và
     // KHÔNG lấy được tên chủ sở hữu (đã tái hiện: 16/16 patent trống "Người nộp", còn Google trả
     // 503 liên tục sau đó). Chậm hơn vài giây nhưng đổi lại có dữ liệu thật.
-    const VERIFY_BATCH = 3;
+    // 8 thay vì 3: nút cổ chai giờ là các lượt gọi Serper — chạy trên hạ tầng của họ nên song song
+    // được thoải mái. Google đang chặn thì trả 503 tức thì, không tốn thời gian.
+    const VERIFY_BATCH = 8;
     const verifications = [];
     for (let i = 0; i < candidates.length; i += VERIFY_BATCH) {
       const batch = candidates.slice(i, i + VERIFY_BATCH);
       const res = await Promise.all(batch.map((c) =>
         c.officialVerified
           ? Promise.resolve({ status: 'verified', realTitle: c.title, verifiedUrl: c.sourceUrl, official: true })
-          : verifyPatentAgainstGooglePatents(c.patentNumber, drugName, c)
+          : verifyPatentAgainstGooglePatents(c.patentNumber, drugName, c, serperKey)
       ));
       verifications.push(...res);
       if (i + VERIFY_BATCH < candidates.length) await delay(900);
@@ -2518,6 +3102,7 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
         // quả tìm kiếm. Phải báo cho giao diện biết để không ghi "Đã đối chiếu Google Patents" —
         // đó là khẳng định sai mức độ chắc chắn, và cũng là lý do "Người nộp" bị trống.
         viaHint: !!v.viaHint,
+        viaSerper: !!v.viaSerper,   // lấy được qua Serper khi Google chặn — vẫn là dữ liệu thật
         sourceUrl: v.verifiedUrl || c.sourceUrl,
         verifyStatus: v.status,
       });
@@ -2645,7 +3230,19 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
     // cứ để khẳng định "không phải hãng gốc" nên loại oan sẽ mất dữ liệu thật một cách vô lý.
     const classified = [...verifiedList.map(applyClassification), ...unverifiedList.map(applyClassification)]
       .filter((p) => p.isFormulation);
-    const nonOriginatorPatents = classified.filter((p) => p.differentCompany);
+    let nonOriginatorPatents = classified.filter((p) => p.differentCompany);
+    let anHet = false;
+    // LƯỚI AN TOÀN: nếu lọc xong KHÔNG còn patent nào thì gần như chắc chắn AI đã xác định thiếu
+    // hãng gốc, chứ không phải thật sự chẳng có patent nào của hãng gốc.
+    // Đã gặp thật với hydroxyzine: AI nêu mỗi "Pfizer" (Vistaril) mà bỏ sót "UCB" (Atarax), khiến
+    // cả 20 patent bị ẩn sạch — trong đó có patent của chính UCB (ghi bằng tiếng Nga "ЮСиБи, С.А.").
+    // Trả danh sách trống là tệ hơn hẳn so với hiển thị kèm cảnh báo.
+    if (classified.length && nonOriginatorPatents.length === classified.length) {
+      console.warn('[OriginatorPatent] Lọc theo hãng gốc loại sạch patent — hiển thị lại kèm cảnh báo.');
+      classified.forEach((p) => { p.differentCompany = false; p.ownerMatch = 'unknown'; });
+      nonOriginatorPatents = [];
+      anHet = true;
+    }
     const finalVerified = classified.filter((p) => !p.differentCompany && p.verifyStatus !== 'unverified');
     const finalUnverified = classified.filter((p) => !p.differentCompany && p.verifyStatus === 'unverified');
 
@@ -2655,6 +3252,7 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
       formulationPatents: finalVerified,
       unverifiedPatents: finalUnverified,
       rejectedPatents: rejectedList,
+      loBoLocHang: anHet,   // báo cho giao diện biết bộ lọc hãng gốc đã bị bỏ qua
       nonOriginatorPatents: nonOriginatorPatents.map((p) => ({ patentNumber: p.patentNumber, applicant: p.applicant, realTitle: p.realTitle })),
       overallNote: classification.overallNote || '',
       googlePatentsUrl: `https://patents.google.com/?q=${encodeURIComponent(drugName)}+formulation`,
@@ -2995,6 +3593,218 @@ function extractGreybPatentRows($) {
   });
   return rows;
 }
+
+// ── Hỏi đáp AI về lựa chọn sản phẩm generic ──────────────────────────────────
+// Ghép 2 nguồn để câu trả lời có sức nặng:
+//   1) greyb_patents — patent hết hạn theo năm, theo hãng, theo nhóm bệnh (từ thư mục GreyB)
+//   2) Dữ liệu Việt Nam — sản lượng & giá trúng thầu thật, giá kê khai
+// Chỉ có patent thì không đủ khuyến nghị; phải biết thị trường VN tiêu thụ bao nhiêu, giá nào,
+// mấy hãng đang làm thì mới nói được "nên hay không nên làm thuốc này".
+
+// ── Bảng xếp hạng "thuốc bom tấn" tại Việt Nam ───────────────────────────────
+// Tính từ 193.388 dòng trúng thầu thật: gộp theo HOẠT CHẤT rồi xếp theo TỔNG DOANH THU.
+// Vì sao cần: trước đây tôi rút từ khoá từ câu hỏi rồi mới đi tra — hỏi "thuốc đái tháo đường"
+// thì rút ra chữ "đường", tra được dữ liệu vô nghĩa và AI phải trả lời "không rõ đường là thuốc gì".
+// Xếp hạng sẵn theo quy mô thị trường thì luôn có bối cảnh tốt, kể cả câu hỏi chung chung.
+let _vnMarketCache = null;
+let _vnMarketAt = 0;
+const VN_MARKET_TTL = 12 * 60 * 60 * 1000;   // tính lại mỗi 12 giờ
+
+async function getVietnamMarketRanking() {
+  if (_vnMarketCache && Date.now() - _vnMarketAt < VN_MARKET_TTL) return _vnMarketCache;
+
+  const agg = new Map();
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await supabaseAdmin.from('drug_tender_prices')
+      .select('hoat_chat,ten_thuoc,dang_bao_che,don_gia,so_luong,thanh_tien,nha_san_xuat,nuoc_san_xuat')
+      .order('id', { ascending: true }).range(from, from + 999);
+    if (error) throw new Error(error.message);
+    if (!data || !data.length) break;
+
+    for (const r of data) {
+      // Chuẩn hoá tên hoạt chất: lấy thành phần ĐẦU TIÊN, bỏ hàm lượng/dạng muối trong ngoặc.
+      // "Methylprednisolon (dưới dạng ... succinat)" → "methylprednisolon"
+      const hc = String(r.hoat_chat || '').split(/[;+(]/)[0]
+        .replace(/[^A-Za-zÀ-ỹ\s-]/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (hc.length < 4) continue;
+      if (!agg.has(hc)) agg.set(hc, {
+        hoatChat: hc, doanhThu: 0, sanLuong: 0, soLuot: 0,
+        gia: [], hang: new Set(), dang: new Map(), bietDuoc: new Set(),
+      });
+      const a = agg.get(hc);
+      a.doanhThu += Number(r.thanh_tien) || 0;
+      a.sanLuong += Number(r.so_luong) || 0;
+      a.soLuot += 1;
+      const g = Number(r.don_gia); if (g > 0) a.gia.push(g);
+      if (r.nha_san_xuat) a.hang.add(String(r.nha_san_xuat).trim());
+      if (r.dang_bao_che) { const k = String(r.dang_bao_che).trim(); a.dang.set(k, (a.dang.get(k) || 0) + 1); }
+      if (r.ten_thuoc && a.bietDuoc.size < 6) a.bietDuoc.add(String(r.ten_thuoc).trim());
+    }
+    if (data.length < 1000) break;
+  }
+
+  const ds = [...agg.values()].map((a) => {
+    a.gia.sort((x, y) => x - y);
+    return {
+      hoatChat: a.hoatChat,
+      doanhThu: Math.round(a.doanhThu),
+      sanLuong: a.sanLuong,
+      soLuot: a.soLuot,
+      giaThapNhat: a.gia[0] || null,
+      giaTrungVi: a.gia[Math.floor(a.gia.length / 2)] || null,
+      giaCaoNhat: a.gia[a.gia.length - 1] || null,
+      soHang: a.hang.size,
+      dangChinh: [...a.dang.entries()].sort((x, y) => y[1] - x[1]).slice(0, 2).map(([k]) => k),
+      bietDuoc: [...a.bietDuoc].slice(0, 4),
+    };
+  }).sort((x, y) => y.doanhThu - x.doanhThu);
+
+  _vnMarketCache = ds;
+  _vnMarketAt = Date.now();
+  console.log(`[VNMarket] Đã xếp hạng ${ds.length} hoạt chất theo doanh thu trúng thầu.`);
+  return ds;
+}
+
+// Rút tên thuốc/hoạt chất có thể có trong câu hỏi để đi tra dữ liệu liên quan.
+function extractDrugNamesFromQuestion(q) {
+  const stop = new Set(['thuoc','nam','generic','patent','viet','nam','cua','cho','nao','gi','the','lam','nen',
+    'san','pham','hang','gia','thau','ke','khai','san','luong','thi','truong','cac','mot','hai','ba','top']);
+  return String(q || '')
+    .split(/[^A-Za-zÀ-ỹ0-9]+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 5 && !stop.has(w.toLowerCase()))
+    .slice(0, 6);
+}
+
+app.post('/api/product-selection/ask', requireApprovedUser, async (req, res) => {
+  try {
+    const question = String(req.body.question || '').trim();
+    if (!question) return res.status(400).json({ error: 'Chưa nhập câu hỏi.' });
+    const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+    if (!openaiKey) return res.status(400).json({ error: 'Thiếu API key.' });
+
+    // ── 1. Patent liên quan ──────────────────────────────────────────────────
+    const tenThuoc = extractDrugNamesFromQuestion(question);
+    const namTrongCauHoi = (question.match(/20\d{2}/g) || []).slice(0, 3);
+    let patents = [];
+
+    if (tenThuoc.length) {
+      const { data } = await supabaseAdmin.from('greyb_patents')
+        .select('drug,patent,company,title,expiry,status,source_name')
+        .or(tenThuoc.map((t) => `drug.ilike.%${t}%`).join(','))
+        .limit(120);
+      patents = data || [];
+    }
+    if (!patents.length && namTrongCauHoi.length) {
+      const { data } = await supabaseAdmin.from('greyb_patents')
+        .select('drug,patent,company,title,expiry,status,source_name')
+        .or(namTrongCauHoi.map((y) => `expiry.ilike.%${y}%`).join(','))
+        .limit(150);
+      patents = data || [];
+    }
+    if (!patents.length) {
+      // Không nhận ra thuốc/năm cụ thể → đưa mẫu rộng để AI vẫn có căn cứ trả lời tổng quan
+      const { data } = await supabaseAdmin.from('greyb_patents')
+        .select('drug,patent,company,title,expiry,status,source_name').limit(150);
+      patents = data || [];
+    }
+
+    // ── 2. Bảng xếp hạng thuốc bom tấn tại VN — LUÔN đưa vào, bất kể câu hỏi ─
+    // Đây là nền để trả lời mọi câu hỏi kiểu "thuốc nào tiềm năng", kể cả thuốc ĐÃ hết bảo hộ.
+    const xepHang = await getVietnamMarketRanking();
+    const TOP = 70;
+    const topBomTan = xepHang.slice(0, TOP);
+
+    // Nếu câu hỏi nhắc tên thuốc cụ thể, đưa thêm hoạt chất đó dù không nằm trong top
+    const themVao = [];
+    for (const ten of tenThuoc) {
+      const t = ten.toLowerCase();
+      const hit = xepHang.find((m) => m.hoatChat.includes(t) || t.includes(m.hoatChat));
+      if (hit && !topBomTan.includes(hit) && !themVao.includes(hit)) themVao.push(hit);
+    }
+    const thiTruong = [...topBomTan, ...themVao];
+
+    const vnd = (n) => (n == null ? 'không rõ' : Number(n).toLocaleString('vi-VN') + 'đ');
+    const ty = (n) => (Number(n) / 1e9).toFixed(1) + ' tỷ';
+
+    // Ghép tình trạng patent vào từng hoạt chất để AI thấy ngay thuốc nào còn/đã hết bảo hộ
+    const patentTheoThuoc = new Map();
+    patents.forEach((p) => {
+      const k = String(p.drug || '').toLowerCase().trim();
+      if (!k) return;
+      if (!patentTheoThuoc.has(k)) patentTheoThuoc.set(k, []);
+      patentTheoThuoc.get(k).push(p);
+    });
+    const timPatent = (hc) => {
+      for (const [k, v] of patentTheoThuoc) if (k.includes(hc) || hc.includes(k)) return v;
+      return null;
+    };
+
+    const boiCanh = [
+      `XẾP HẠNG THUỐC THEO QUY MÔ THỊ TRƯỜNG VIỆT NAM (tính từ ${(193388).toLocaleString('vi-VN')} lượt trúng thầu thật 2022-2024, xếp theo TỔNG DOANH THU):`,
+      ...thiTruong.map((m, i) => {
+        const pt = timPatent(m.hoatChat);
+        const patentInfo = pt
+          ? ` | PATENT: ${pt.slice(0, 2).map((p) => `${p.patent} hết hạn ${p.expiry || '?'}`).join(', ')}`
+          : ' | PATENT: không có trong dữ liệu patent (nhiều khả năng đã hết bảo hộ từ lâu)';
+        return `${i + 1}. ${m.hoatChat} — doanh thu ${ty(m.doanhThu)} đồng, sản lượng ${m.sanLuong.toLocaleString('vi-VN')} đơn vị, ` +
+          `${m.soLuot} lượt trúng thầu, giá ${vnd(m.giaThapNhat)}–${vnd(m.giaCaoNhat)} (trung vị ${vnd(m.giaTrungVi)}), ` +
+          `${m.soHang} hãng cạnh tranh, dạng: ${m.dangChinh.join('/')}, biệt dược: ${m.bietDuoc.slice(0, 3).join(', ')}${patentInfo}`;
+      }),
+      '',
+      `DỮ LIỆU PATENT HẾT HẠN (${patents.length} dòng, từ thư mục GreyB):`,
+      ...patents.slice(0, 80).map((p) =>
+        `- ${p.drug || '?'} | ${p.patent || ''} | hãng: ${p.company || '?'} | hết hạn: ${p.expiry || '?'} | ${p.status || ''}`),
+    ].join('\n');
+
+    const messages = [
+      {
+        role: 'system',
+        content: `Bạn là cố vấn chiến lược R&D của một công ty dược Việt Nam, tư vấn CHỌN SẢN PHẨM để phát triển thuốc generic.
+
+NGUYÊN TẮC BẮT BUỘC:
+1. CHỈ dùng số liệu có trong phần DỮ LIỆU được cung cấp. TUYỆT ĐỐI KHÔNG bịa tên thuốc, số patent, ngày hết hạn, giá, sản lượng.
+2. Nếu dữ liệu không đủ để kết luận, NÓI THẲNG là chưa đủ và nêu cần thêm thông tin gì — đừng đoán bừa cho có vẻ chắc chắn.
+3. Khi khuyến nghị, phải nêu RÕ CĂN CỨ bằng con số cụ thể lấy từ dữ liệu (sản lượng, giá, số hãng cạnh tranh, năm hết hạn patent).
+4. Nêu CẢ MẶT TRÁI: rủi ro, điểm bất lợi, lý do có thể KHÔNG nên làm. Một khuyến nghị chỉ có ưu điểm là khuyến nghị đáng ngờ.
+
+TIÊU CHÍ CHỌN — ưu tiên hàng đầu là QUY MÔ THỊ TRƯỜNG (thuốc bom tấn):
+- Thuốc "bom tấn" = doanh thu trúng thầu lớn tại Việt Nam. Đây là tiêu chí SỐ MỘT.
+- XÉT CẢ THUỐC ĐÃ HẾT BẢO HỘ TỪ LÂU. Hết patent không có nghĩa là hết cơ hội: thị trường lớn,
+  không vướng pháp lý, rào cản là năng lực sản xuất và giá thành. Nhiều thuốc doanh thu cao nhất
+  ở VN chính là thuốc đã hết bảo hộ.
+- Sau đó mới xét: mức giá (giá cao = biên lợi nhuận tốt hơn), số hãng đang cạnh tranh
+  (ít hãng = dễ chen chân), độ khó của dạng bào chế, và thời điểm hết patent nếu thuốc còn bảo hộ.
+
+CÁCH TRẢ LỜI:
+- Khi được hỏi "thuốc nào tiềm năng", hãy CHỌN RA 3-5 CÁI TÊN CỤ THỂ từ bảng xếp hạng và xếp thứ tự
+  ưu tiên, kèm con số doanh thu/sản lượng/giá/số hãng để chứng minh. KHÔNG trả lời chung chung.
+- Nếu nhiều hãng đã cạnh tranh nhưng doanh thu rất lớn, vẫn có thể đáng làm — hãy cân nhắc chứ
+  đừng loại ngay.
+- Ghi rõ hoạt chất nào KHÔNG có trong dữ liệu patent thì nhiều khả năng đã hết bảo hộ từ lâu
+  (làm được ngay), chứ đừng nói "không xác định được nên không khuyến nghị".
+
+Viết TIẾNG VIỆT tự nhiên, mạch lạc, đi thẳng vào vấn đề. KHÔNG dùng dấu * hay #.
+Trả lời như một người tư vấn có chính kiến: đưa ra khuyến nghị rõ ràng kèm lý do, không nói nước đôi.`,
+      },
+      ...(Array.isArray(req.body.history) ? req.body.history.slice(-6) : []),
+      { role: 'user', content: `${boiCanh}\n\n=== CÂU HỎI ===\n${question}` },
+    ];
+
+    // Gemini 2.5 Flash — chọn làm mức cân bằng: rẻ hơn Gemini 3.8 Flash khoảng 2 lần
+    // (0,30/2,50 so với 0,75/3,75 USD mỗi triệu token) mà không chậm như bản Flash-Lite
+    // (đã đo: Flash-Lite mất 91 giây cho cùng câu hỏi).
+    // Cần max_tokens rộng: để hẹp thì model bị cắt giữa chừng, trả ra câu cụt.
+    const answer = await callOpenAI(openaiKey, messages, 'google/gemini-2.5-flash', 2, 4000);
+    res.json({
+      answer: String(answer || '').trim(),
+      soPatentThamChieu: patents.length,
+      soHoatChatXepHang: thiTruong.length,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 app.post('/api/product-selection/summarize-link', requireApprovedUser, async (req, res) => {
   const { url } = req.body;

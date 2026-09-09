@@ -552,6 +552,7 @@
             <div class="psel-mode-toggle">
               <button class="psel-mode-btn active" id="psel-mode-originator-btn" onclick="pselSwitchMode('originator')">🔎 Tìm patent dạng bào chế của hãng phát minh</button>
               <button class="psel-mode-btn" id="psel-mode-browse-btn" onclick="pselSwitchMode('browse')">📚 Danh sách patent hết hạn</button>
+              <button class="psel-mode-btn" id="psel-mode-price-btn" onclick="pselSwitchMode('price')">💰 Tra cứu giá thuốc Việt Nam</button>
             </div>
 
             <!-- Chế độ 1: Tìm patent dạng bào chế theo tên + dạng bào chế -->
@@ -576,6 +577,33 @@
                 <div class="skeleton" style="height:160px;border-radius:12px;"></div>
               </div>
 
+              <!-- Hỏi đáp AI về chọn sản phẩm generic — đặt dưới thư mục patent hết hạn -->
+              <div class="section-card" id="psel-ask-card" style="margin:1.5rem 0 0">
+                <div class="section-header">
+                  <div class="section-icon icon-purple">🧠</div>
+                  <div class="section-title">Hỏi đáp chọn sản phẩm generic</div>
+                  <div class="section-subtitle">Dựa trên dữ liệu patent hết hạn + sản lượng &amp; giá trúng thầu thật tại Việt Nam</div>
+                </div>
+                <div class="section-body">
+                  <div class="text-sm text-2" style="margin-bottom:.7rem;line-height:1.7">
+                    Hỏi về việc chọn thuốc để làm generic những năm tới. Trả lời dựa trên dữ liệu thật, có nêu cả rủi ro chứ không chỉ mặt tốt.
+                    <div class="text-3" style="margin-top:.4rem">
+                      Ví dụ:
+                      <span class="psel-ask-eg" onclick="pselAskFill(this)">Thuốc nào hết patent 2027 đáng làm generic nhất ở Việt Nam?</span> ·
+                      <span class="psel-ask-eg" onclick="pselAskFill(this)">Có nên làm generic rosuvastatin không?</span> ·
+                      <span class="psel-ask-eg" onclick="pselAskFill(this)">So sánh cơ hội giữa pregabalin và celecoxib</span>
+                    </div>
+                  </div>
+                  <div class="psel-form-row">
+                    <input type="text" id="psel-ask-input" class="input-field"
+                           placeholder="Nhập câu hỏi về lựa chọn sản phẩm generic..."
+                           onkeydown="if(event.key==='Enter')pselAsk()">
+                    <button class="btn-search" onclick="pselAsk()">🧠 Hỏi</button>
+                  </div>
+                  <div id="psel-ask-output"></div>
+                </div>
+              </div>
+
               <!-- Xem 1 danh sách đã chọn -->
               <div id="psel-list-view" hidden>
                 <button class="psel-hub-back" onclick="pselBackToHub()">← Quay lại danh mục</button>
@@ -591,6 +619,61 @@
                     <div class="empty-state-icon">📅</div>
                     <div class="empty-state-sub">Chọn năm để xem các thuốc có patent/độc quyền hết hạn trong năm đó (nguồn: FDA Orange Book).</div>
                   </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Chế độ 3: Tra cứu giá thuốc Việt Nam (giá kê khai + giá trúng thầu) -->
+            <div id="psel-mode-price" class="psel-mode-panel">
+              <div class="psel-sub-toggle">
+                <button class="psel-sub-btn active" id="pprice-tab-kekhai-btn" onclick="pselPriceSwitch('kekhai')">📋 Giá kê khai</button>
+                <button class="psel-sub-btn" id="pprice-tab-thau-btn" onclick="pselPriceSwitch('thau')">🏥 Giá trúng thầu</button>
+              </div>
+
+              <div class="psel-form-row" style="margin-bottom:.6rem">
+                <input type="text" id="pprice-search" class="input-field" placeholder="Tên thuốc hoặc hoạt chất — thuốc phối hợp thì ngăn bằng dấu + (vd: paracetamol + codein)">
+              </div>
+              <div class="psel-form-row">
+                <input type="text" id="pprice-form" class="input-field" list="pprice-form-list"
+                       placeholder="Lọc theo dạng bào chế — để trống nếu lấy tất cả (vd: viên nang, viên nén bao phim...)">
+                <!-- Gõ một phần cũng khớp: "viên nang" ra cả "Viên nang cứng" lẫn "Viên nang mềm".
+                     Dữ liệu thật có hơn 228 dạng khác nhau nên không làm danh sách cố định được,
+                     đây chỉ là gợi ý các dạng hay gặp nhất. -->
+                <datalist id="pprice-form-list">
+                  <option value="Viên nén bao phim"></option>
+                  <option value="Viên nén"></option>
+                  <option value="Viên nang cứng"></option>
+                  <option value="Viên nén phóng thích kéo dài"></option>
+                  <option value="Dung dịch tiêm"></option>
+                  <option value="Dung dịch tiêm truyền"></option>
+                  <option value="Bột đông khô pha tiêm"></option>
+                  <option value="Bột pha tiêm"></option>
+                  <option value="Hỗn dịch tiêm"></option>
+                  <option value="Dung dịch uống"></option>
+                  <option value="Thuốc bột uống"></option>
+                  <option value="Bột pha hỗn dịch uống"></option>
+                </datalist>
+                <button class="btn-search" onclick="pselPriceSearch()">🔎 Tra cứu</button>
+              </div>
+
+              <!-- Hướng dẫn dùng chung cho cả 2 tab (giá kê khai & giá trúng thầu) vì dùng chung ô nhập -->
+              <div class="insight-box" style="margin-bottom:1rem">
+                <div class="insight-label">💡 Cách tra cứu</div>
+                <div class="text-sm text-2" style="margin-top:.4rem;line-height:1.7">
+                  <b>Thuốc 1 hoạt chất:</b> gõ tên hoạt chất hoặc tên thương mại — <i>paracetamol</i>, <i>Panadol</i>.<br>
+                  <b>Thuốc phối hợp nhiều hoạt chất:</b> ngăn các hoạt chất bằng dấu <b>+</b> — <i>paracetamol + codein</i>, <i>losartan + hydrochlorothiazide</i>.
+                  Cũng dùng được dấu <b>;</b> <b>,</b> <b>/</b> hoặc chữ <b>và</b>.
+                  <span class="text-3">Không cần đúng thứ tự: dữ liệu ghi "Codein; Paracetamol" hay "Paracetamol; Codein" đều tìm ra.</span><br>
+                  <b>Dạng bào chế:</b> gõ một phần cũng được — <i>viên nang</i> ra cả "Viên nang cứng" lẫn "Viên nang mềm". Để trống nếu muốn xem tất cả các dạng.<br>
+                  <span class="text-3">Kết quả sắp theo giá tăng dần để dễ so sánh.</span>
+                </div>
+              </div>
+
+              <div id="pprice-meta" class="text-sm text-3" style="margin:.5rem 0"></div>
+              <div id="sec-pprice-results">
+                <div class="empty-state" style="padding:2rem">
+                  <div class="empty-state-icon">💰</div>
+                  <div class="empty-state-sub">Nhập tên thuốc/hoạt chất để tra giá kê khai hoặc giá trúng thầu.</div>
                 </div>
               </div>
             </div>

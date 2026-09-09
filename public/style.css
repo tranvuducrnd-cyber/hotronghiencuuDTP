@@ -1305,6 +1305,17 @@ select.input-field:invalid { color: var(--text-3); }
 .psel-mode-panel { display: none; }
 .psel-mode-panel.active { display: block; }
 
+/* Tab con trong mục Tra cứu giá thuốc (giá kê khai / giá trúng thầu) — nhẹ hơn tab chính để
+   nhìn ra ngay đây là cấp dưới, không ngang hàng với 3 mục lớn. */
+.psel-sub-toggle { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 1rem; }
+.psel-sub-btn {
+  border: 1px solid var(--card-border); background: #fff; color: var(--text-2);
+  border-radius: 8px; padding: 0.4rem 0.9rem; font-size: 0.78rem; font-weight: 600;
+  cursor: pointer; transition: all 0.15s;
+}
+.psel-sub-btn:hover { border-color: rgba(37,99,235,0.5); color: var(--blue); }
+.psel-sub-btn.active { background: rgba(37,99,235,0.1); color: #1d4ed8; border-color: rgba(37,99,235,0.45); }
+
 .psel-form-row { display: flex; gap: 0.7rem; flex-wrap: wrap; margin-bottom: 1.1rem; }
 .psel-form-row .input-field { flex: 1; min-width: 220px; }
 
@@ -1380,3 +1391,9 @@ select.input-field:invalid { color: var(--text-3); }
 .psel-rows-wrap .data-table th { position: sticky; top: 0; background: #f1f5f9; z-index: 1; }
 .psel-rows-wrap::-webkit-scrollbar { width: 8px; height: 8px; }
 .psel-rows-wrap::-webkit-scrollbar-thumb { background: var(--card-border); border-radius: 8px; }
+
+/* Câu hỏi mẫu bấm được ở phần hỏi đáp chọn sản phẩm generic */
+.psel-ask-eg {
+  cursor: pointer; color: var(--blue); border-bottom: 1px dashed currentColor;
+}
+.psel-ask-eg:hover { opacity: .75; }

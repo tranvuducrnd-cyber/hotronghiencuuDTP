@@ -3002,13 +3002,195 @@ function loadProductSelection() {
   }
 }
 
+// ── Hỏi đáp chọn sản phẩm generic ─────────────────────────────────────────────
+let _pselAskHistory = [];
+
+function pselAskFill(el) {
+  const box = document.getElementById('psel-ask-input');
+  if (box) { box.value = el.textContent.trim(); box.focus(); }
+}
+
+async function pselAsk() {
+  const box = document.getElementById('psel-ask-input');
+  const out = document.getElementById('psel-ask-output');
+  const question = (box.value || '').trim();
+  if (!question) return;
+  out.innerHTML = '<div class="skeleton" style="height:90px;border-radius:12px;margin-top:.8rem"></div>';
+  try {
+    const d = await api('/api/product-selection/ask', {
+      question,
+      openaiKey: state.openaiKey || localStorage.getItem('openai_api_key') || '',
+      history: _pselAskHistory,
+    });
+    _pselAskHistory.push({ role: 'user', content: question });
+    _pselAskHistory.push({ role: 'assistant', content: d.answer });
+    if (_pselAskHistory.length > 6) _pselAskHistory = _pselAskHistory.slice(-6);
+
+    // Nêu rõ câu trả lời dựa trên bao nhiêu dữ liệu — để người dùng biết mức độ căn cứ.
+    const nguon = [
+      d.soPatentThamChieu ? `${d.soPatentThamChieu} dòng patent` : '',
+      d.soHoatChatXepHang ? `xếp hạng thị trường VN của ${d.soHoatChatXepHang} hoạt chất` : '',
+    ].filter(Boolean).join(' · ');
+
+    out.innerHTML = `
+      <div class="insight-box mt-2">
+        <div class="insight-label">🧠 Trả lời</div>
+        <!-- Dùng mdToHtml (đã có sẵn): vừa định dạng đẹp vừa BỎ dấu * và # — model vẫn viết
+             markdown dù prompt đã dặn, nên xử lý ở khâu hiển thị chắc chắn hơn là bắt model nghe lời. -->
+        <div style="line-height:1.75">${mdToHtml(d.answer)}</div>
+        ${nguon ? `<div class="text-3 text-sm" style="margin-top:.7rem;border-top:1px solid var(--card-border);padding-top:.5rem">📊 Căn cứ: ${escHtml(nguon)}</div>` : ''}
+      </div>`;
+    box.value = '';
+  } catch (e) {
+    out.innerHTML = `<div class="insight-box amber mt-2"><div class="insight-label amber">⚠️ Lỗi</div>${escHtml(e.message)}</div>`;
+  }
+}
+
 function pselSwitchMode(mode) {
   document.querySelectorAll('.psel-mode-panel').forEach((p) => p.classList.remove('active'));
   document.querySelectorAll('.psel-mode-btn').forEach((b) => b.classList.remove('active'));
   document.getElementById('psel-mode-' + mode).classList.add('active');
   document.getElementById('psel-mode-' + mode + '-btn').classList.add('active');
   if (mode === 'browse') pselLoadHub();
+  if (mode === 'price') pselPriceInit();
 }
+
+// ── Tra cứu giá thuốc Việt Nam (giá kê khai / giá trúng thầu) ─────────────────
+// Dữ liệu lấy từ file công bố chính thức do quản trị viên tải lên — KHÔNG lấy từ cổng web của cơ
+// quan quản lý, vì đã kiểm và thấy các cổng đó hiện không truy cập được (congkhaiyte.moh.gov.vn
+// từ chối kết nối cổng 443, drugbank.vn không phân giải được tên miền).
+let _ppriceTab = 'kekhai';
+
+function pselPriceInit() {
+  pselPriceLoadMeta();
+}
+
+function pselPriceSwitch(tab) {
+  _ppriceTab = tab;
+  document.querySelectorAll('.psel-sub-btn').forEach((b) => b.classList.remove('active'));
+  const btn = document.getElementById('pprice-tab-' + tab + '-btn');
+  if (btn) btn.classList.add('active');
+  setInner('sec-pprice-results', `<div class="empty-state" style="padding:2rem">
+    <div class="empty-state-icon">💰</div>
+    <div class="empty-state-sub">Nhập tên thuốc/hoạt chất để tra ${tab === 'kekhai' ? 'giá kê khai' : 'giá trúng thầu'}.</div>
+  </div>`);
+  pselPriceLoadMeta();
+}
+
+// Cho biết dữ liệu đang dùng là file nào, tải lúc nào — để người dùng biết độ mới của giá.
+// Thống kê + nhận xét giá. Các CON SỐ do máy chủ tính trên toàn bộ dòng khớp (không phải 300
+// dòng đang hiển thị), AI chỉ diễn giải — nên số liệu ở đây luôn khớp dữ liệu thật.
+async function pselPriceSummary(q, dosageForm) {
+  const el = document.getElementById('pprice-summary');
+  if (!el) return;
+  try {
+    const d = await api('/api/price/summary', { type: _ppriceTab, q, dosageForm });
+    const s = d.stats;
+    if (!s) { el.innerHTML = ''; return; }
+    const vnd = (n) => Number(n).toLocaleString('vi-VN') + 'đ';
+    const dong = (t, r) => `<div class="mt-1"><b>${t}:</b> ${vnd(r.donGia)}/${escHtml(r.donViTinh || '')}
+      — ${escHtml(r.tenThuoc)}${r.hamLuong ? ' ' + escHtml(r.hamLuong) : ''}
+      <span class="text-3">(${escHtml(r.nhaSanXuat || 'không rõ NSX')}${r.nuocSanXuat ? ' — ' + escHtml(r.nuocSanXuat) : ''})</span></div>`;
+    el.innerHTML = `
+      <div class="section-card" style="margin:0">
+        <div class="section-header"><div class="section-icon icon-green">📊</div>
+          <div class="section-title">Phân tích ${s.laKeKhai ? 'giá kê khai' : 'giá trúng thầu'}</div>
+          <div class="section-subtitle">${s.soDong.toLocaleString('vi-VN')} ${s.laKeKhai ? 'bản kê khai' : 'dòng'}${s.dayDu ? '' : ' (mẫu tối đa 20.000)'}</div>
+        </div>
+        <div class="section-body">
+          ${dong('Thấp nhất', s.reNhat)}
+          ${dong('Cao nhất', s.datNhat)}
+          <div class="mt-1"><b>Giá phổ biến nhất:</b> khoảng ${vnd(s.giaPhoBien)} (${s.soLuotGiaPhoBien.toLocaleString('vi-VN')} lượt trúng thầu quanh mức này)</div>
+          <div class="mt-1"><b>Trung vị:</b> ${vnd(s.trungVi)}${s.chenhLech ? ` · <b>Chênh lệch cao/thấp:</b> ${s.chenhLech} lần` : ''}</div>
+          <div class="mt-1"><b>Hãng nhiều lượt trúng thầu nhất:</b> ${s.topNhaSanXuat.map((m) => `${escHtml(m.ten)} (${m.soLuot})`).join(' · ')}</div>
+
+          ${(s.topSanPham || []).length ? `
+          <div class="data-item-label" style="margin:1.2rem 0 .5rem">🏆 ${s.laKeKhai
+            ? 'Top 10 mặt hàng được kê khai nhiều lần nhất'
+            : 'Top 10 sản phẩm theo tổng lượng trúng thầu (gộp cả 3 năm)'}</div>
+          <div class="psel-rows-wrap">
+            <table class="data-table">
+              <thead><tr>
+                <th>#</th><th>Tên thuốc</th><th>Hàm lượng</th><th>Nhà sản xuất</th>
+                ${s.laKeKhai ? '' : '<th>Tổng lượng</th><th>Thành tiền</th>'}
+                <th>${s.laKeKhai ? 'Số bản kê khai' : 'Số lượt'}</th><th>Khoảng giá</th>
+                ${s.laKeKhai ? '' : '<th>Năm</th>'}
+              </tr></thead>
+              <tbody>${s.topSanPham.map((g, i) => `<tr>
+                <td>${i + 1}</td>
+                <td>${escHtml(g.tenThuoc || '')}</td>
+                <td>${escHtml(g.hamLuong || '')}</td>
+                <td>${escHtml(g.nhaSanXuat || '')}${g.nuocSanXuat ? ` <span class="text-3">(${escHtml(g.nuocSanXuat)})</span>` : ''}</td>
+                ${s.laKeKhai ? '' : `<td><b>${Number(g.tongLuong).toLocaleString('vi-VN')}</b> ${escHtml(g.donViTinh || '')}</td>
+                <td>${vnd(Math.round(g.tongTien))}</td>`}
+                <td>${g.soLuot}</td>
+                <td>${g.giaMin != null ? `${vnd(g.giaMin)}${g.giaMax !== g.giaMin ? ' – ' + vnd(g.giaMax) : ''}` : ''}</td>
+                ${s.laKeKhai ? '' : `<td>${escHtml(g.nam || '')}</td>`}
+              </tr>`).join('')}</tbody>
+            </table>
+          </div>` : ''}
+
+          ${d.comment ? `<div class="insight-box mt-2"><div class="insight-label">🤖 Nhận xét</div>${escHtml(d.comment)}</div>` : ''}
+        </div>
+      </div>`;
+  } catch (e) {
+    el.innerHTML = `<div class="text-sm" style="color:#b45309">⚠️ Không lấy được phân tích giá: ${escHtml(e.message)}</div>`;
+  }
+}
+
+async function pselPriceLoadMeta() {
+  const el = document.getElementById('pprice-meta');
+  if (!el) return;
+  // Xoá thông tin của tab trước ngay lập tức — nếu để nguyên, trong lúc chờ phản hồi người dùng
+  // sẽ đọc nhầm thông tin của tab kia (vd đang ở "Giá trúng thầu" nhưng vẫn thấy dòng "chưa có
+  // dữ liệu" còn sót lại của "Giá kê khai").
+  el.innerHTML = '<span class="text-3">⏳ Đang tải thông tin dữ liệu...</span>';
+  try {
+    const d = await api('/api/price/meta', { type: _ppriceTab });
+    el.innerHTML = d && d.fileName
+      ? `📄 Dữ liệu: <b>${escHtml(d.fileName)}</b> — ${Number(d.rowCount || 0).toLocaleString('vi-VN')} dòng · cập nhật ${escHtml(d.uploadedAt || '')}`
+      : '<span style="color:#b45309">⚠️ Chưa có dữ liệu — cần quản trị viên tải file công bố lên.</span>';
+  } catch (e) { el.textContent = ''; }
+}
+
+async function pselPriceSearch() {
+  const q = (document.getElementById('pprice-search').value || '').trim();
+  const dosageForm = (document.getElementById('pprice-form').value || '').trim();
+  const out = document.getElementById('sec-pprice-results');
+  if (!q) { out.innerHTML = '<div class="insight-box amber"><div class="insight-label amber">⚠️</div>Nhập tên thuốc hoặc hoạt chất trước.</div>'; return; }
+  out.innerHTML = '<div class="skeleton" style="height:120px;border-radius:12px"></div>';
+  try {
+    const d = await api('/api/price/search', { type: _ppriceTab, q, dosageForm });
+    const cols = d.columns || [];
+    const rows = d.rows || [];
+    if (!rows.length) {
+      // Nêu rõ đã lọc dạng bào chế nào — nếu không, người dùng dễ tưởng thuốc không có trong dữ
+      // liệu, trong khi thực ra chỉ là không có ở đúng dạng bào chế vừa lọc.
+      out.innerHTML = `<div class="empty-state" style="padding:2rem"><div class="empty-state-icon">🔍</div>
+        <div class="empty-state-sub">Không tìm thấy "${escHtml(q)}"${dosageForm ? ` ở dạng bào chế "${escHtml(dosageForm)}"` : ''} trong dữ liệu ${_ppriceTab === 'kekhai' ? 'giá kê khai' : 'giá trúng thầu'}.${dosageForm ? '<br>Thử bỏ trống ô dạng bào chế để xem tất cả các dạng.' : ''}</div></div>`;
+      return;
+    }
+    // Bảng tự thích ứng theo đúng các cột có trong file công bố — không ép khuôn cột cố định,
+    // vì mỗi đợt công bố của cơ quan quản lý đặt tên/số cột khác nhau.
+    out.innerHTML = `
+      <div class="text-sm text-3" style="margin-bottom:.5rem">Hiển thị toàn bộ <b>${rows.length.toLocaleString('vi-VN')}</b> dòng khớp${d.truncated ? ' — <span style="color:#b45309">đã chạm trần 20.000 dòng, hãy thu hẹp từ khoá để xem đủ</span>' : ''}</div>
+      ${d.davNote ? `<div class="text-sm" style="margin-bottom:.5rem;color:${d.davNote.startsWith('⚠️') ? '#b45309' : 'var(--text-3)'}">${escHtml(d.davNote)}</div>` : ''}
+      <div class="psel-rows-wrap">
+        <table class="data-table">
+          <thead><tr>${cols.map((c) => `<th>${escHtml(c)}</th>`).join('')}</tr></thead>
+          <tbody>${rows.map((r) => `<tr>${r.map((v) => `<td>${escHtml(v == null ? '' : String(v))}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div id="pprice-summary" style="margin-top:1rem">
+        <div class="text-sm text-3">⏳ Đang phân tích giá...</div>
+      </div>`;
+    // Gọi SAU khi bảng đã hiện: phần nhận xét cần gọi AI nên chậm hơn, không để nó chặn bảng.
+    pselPriceSummary(q, dosageForm);
+  } catch (e) {
+    out.innerHTML = `<div class="insight-box amber"><div class="insight-label amber">⚠️ Lỗi</div>${escHtml(e.message)}</div>`;
+  }
+}
+
 
 // ── Danh sách patent hết hạn: thư mục kiểu Pharsight/GreyB ──────────────────────
 let _pselHubLoaded = false;
@@ -3222,6 +3404,10 @@ function pselPatentCardHtml(p, idx) {
     ? '<span class="psel-badge psel-badge-official">🏛️ FDA Orange Book (chính thức)</span>'
     : p.verifyStatus === 'unverified'
       ? `<span class="psel-badge psel-badge-warn" title="${escHtml(p.unverifiedReason || '')}">⚠️ Chưa xác minh được</span>`
+      : p.viaSerper
+        // Lấy được trang patent qua dịch vụ tải hộ (Google chặn IP máy chủ) — dữ liệu vẫn là
+        // nội dung thật của trang patent, nên vẫn coi là đã đối chiếu.
+        ? '<span class="psel-badge psel-badge-green" title="Google Patents chặn IP máy chủ nên trang được tải qua dịch vụ trung gian — nội dung vẫn là trang patent thật.">✓ Đã đối chiếu (qua nguồn trung gian)</span>'
       : p.viaHint
         // Không mở được trang patent (Google Patents chặn tạm) — chỉ khớp qua đoạn trích tìm kiếm.
         // Không được ghi "Đã đối chiếu Google Patents" vì thực tế chưa đối chiếu, và đây cũng chính
@@ -3318,6 +3504,7 @@ async function pselFindOriginator() {
 
     out.innerHTML = `
       ${header}
+      ${d.loBoLocHang ? `<div class="insight-box amber" style="margin-bottom:1rem"><div class="insight-label amber">⚠️ Đã bỏ lọc theo hãng phát minh</div>Nếu lọc theo hãng gốc thì KHÔNG còn patent nào — nhiều khả năng AI xác định thiếu một dòng hãng gốc. Danh sách dưới đây là <b>toàn bộ patent tìm được</b>, chưa lọc theo hãng, hãy tự đối chiếu cột "Người nộp".</div>` : ''}
       ${cards}
       ${unverifiedCards}
       ${pselRejectedHtml(d.rejectedPatents)}
