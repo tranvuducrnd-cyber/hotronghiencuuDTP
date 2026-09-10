@@ -521,13 +521,41 @@ const SOURCE_TLD_RULES = [
 ];
 
 // THANG ĐIỂM 100 — bậc quyết định KHOẢNG điểm, điểm thưởng chỉ phân biệt TRONG khoảng đó.
-// Khoảng cách giữa các bậc (20 điểm) > tổng điểm thưởng tối đa (15 điểm) nên một tài liệu KHÔNG
-// BAO GIỜ vượt bậc: bậc 2 cao nhất = 65+15 = 80 < bậc 1 thấp nhất = 85. Giữ đúng nguyên tắc
-// "tài liệu pháp quy đứng trên bài báo bình duyệt".
+// NGÂN SÁCH ĐIỂM THƯỞNG TỐI ĐA = 19 (8 trích dẫn + 6 h-index + 3 toàn văn + 2 DOI), luôn NHỎ HƠN
+// khoảng cách giữa hai bậc (20). Nhờ vậy một tài liệu KHÔNG BAO GIỜ vượt bậc: bậc 2 cao nhất =
+// 65+19 = 84 < bậc 1 thấp nhất = 85. Giữ đúng nguyên tắc "tài liệu pháp quy đứng trên bài báo
+// bình duyệt" — với hồ sơ đăng ký thuốc thì hướng dẫn của FDA/EMA vẫn là căn cứ cao hơn mọi bài
+// báo, dù bài báo đó được trích dẫn bao nhiêu lần đi nữa.
+// ⚠️ Thêm bất kỳ điểm thưởng nào nữa thì phải giữ TỔNG ≤ 19, nếu không nguyên tắc trên sẽ vỡ.
 const SOURCE_TIER_BASE = { 1: 85, 2: 65, 3: 45, 4: 20 };
 
-// Nhận {url, title, doi?, hasBody?} — danh sách nào thiếu `doi`/`hasBody` vẫn chấm đúng qua domain
-// (chỉ là không có điểm thưởng để phân biệt thêm — trung thực với dữ liệu đang có).
+// Số TRÍCH DẪN/NĂM chứ không phải tổng trích dẫn — nếu lấy tổng thì bài 2010 luôn thắng bài 2025
+// chỉ nhờ có nhiều thời gian tích luỹ, chứ không phải vì có giá trị hơn.
+// Các mốc đặt theo mặt bằng ngành bào chế/dược (thấp hơn hẳn ung thư hay sinh học phân tử).
+const SOURCE_CITATION_BANDS = [
+  { min: 20,  pts: 8, mo: 'trích dẫn rất cao' },
+  { min: 10,  pts: 6, mo: 'trích dẫn cao' },
+  { min: 5,   pts: 4, mo: 'trích dẫn khá' },
+  { min: 2,   pts: 2, mo: 'trích dẫn trung bình' },
+  { min: 0.5, pts: 1, mo: 'ít trích dẫn' },
+];
+// h-index của tác giả CAO NHẤT trong nhóm — đại diện cho uy tín học thuật của nhóm nghiên cứu.
+const SOURCE_HINDEX_BANDS = [
+  { min: 40, pts: 6, mo: 'tác giả đầu ngành' },
+  { min: 25, pts: 5, mo: 'tác giả uy tín cao' },
+  { min: 15, pts: 3, mo: 'tác giả có uy tín' },
+  { min: 8,  pts: 2, mo: 'tác giả đã có công bố đều' },
+  { min: 1,  pts: 1, mo: 'tác giả mới' },
+];
+function _bandPoints(bands, v) {
+  if (typeof v !== 'number' || !isFinite(v)) return null;
+  for (const b of bands) if (v >= b.min) return b;
+  return null;
+}
+
+// Nhận {url, title, doi?, hasBody?, citationsPerYear?, authorHIndex?} — danh sách nào thiếu trường
+// nào thì đơn giản là không có điểm thưởng tương ứng. KHÔNG suy đoán, không gán số mặc định:
+// một bài chưa tra được số trích dẫn phải khác hẳn với một bài đã tra và biết chắc là 0 trích dẫn.
 function scoreSourceCredibility(s) {
   let host = '';
   let tier = 4;
@@ -558,13 +586,30 @@ function scoreSourceCredibility(s) {
   let points = SOURCE_TIER_BASE[tier];
 
   // DOI nằm ngay trong URL = mã của CHÍNH bài này (chắc chắn). DOI chỉ tìm thấy trong nội dung thì
-  // kém chắc hơn — rất có thể là DOI của một bài khác được trích dẫn bên trong → cộng ít hơn.
-  if (doi) {
-    if (String(s.url || '').includes(doi)) { points += 10; reasons.push('DOI trong URL +10'); }
-    else { points += 5; reasons.push('DOI trong nội dung +5'); }
-  }
+  // kém chắc hơn — rất có thể là DOI của một bài khác được trích dẫn bên trong → không cộng.
+  if (doi && String(s.url || '').includes(doi)) { points += 2; reasons.push('DOI trong URL +2'); }
   // Máy chủ đọc được toàn văn (>500 ký tự) = tài liệu truy cập và kiểm chứng được thật.
-  if (s && s.hasBody) { points += 5; reasons.push('đọc được toàn văn +5'); }
+  if (s && s.hasBody) { points += 3; reasons.push('đọc được toàn văn +3'); }
+
+  // TRÍCH DẪN — số liệu lấy từ OpenAlex, không phải AI ước lượng.
+  const cpy = s && typeof s.citationsPerYear === 'number' ? s.citationsPerYear : null;
+  const bandC = _bandPoints(SOURCE_CITATION_BANDS, cpy);
+  if (bandC) {
+    points += bandC.pts;
+    reasons.push(`${bandC.mo} (${cpy}/năm, tổng ${s.citations}) +${bandC.pts}`);
+  } else if (s && typeof s.citations === 'number') {
+    // Đã tra được nhưng gần như chưa ai trích dẫn — ghi rõ để người dùng biết là ĐÃ KIỂM, chứ
+    // không phải thiếu dữ liệu. Không trừ điểm: bài mới công bố chưa kịp có trích dẫn.
+    reasons.push(`chưa được trích dẫn đáng kể (${s.citations}) +0`);
+  }
+
+  // UY TÍN TÁC GIẢ — h-index của tác giả cao nhất trong nhóm.
+  const hIdx = s && typeof s.authorHIndex === 'number' ? s.authorHIndex : null;
+  const bandH = _bandPoints(SOURCE_HINDEX_BANDS, hIdx);
+  if (bandH) {
+    points += bandH.pts;
+    reasons.push(`${bandH.mo} (h-index ${hIdx}${s.authorTop ? ', ' + s.authorTop : ''}) +${bandH.pts}`);
+  }
 
   return { tier, points, label: SOURCE_TIER_LABEL[tier], host, reasons };
 }
@@ -575,6 +620,26 @@ const SOURCE_TIER_COLOR = {
   3: { fg: '#7c3aed', bg: 'rgba(124,58,237,0.1)' },
   4: { fg: '#94a3b8', bg: 'rgba(148,163,184,0.12)' },
 };
+// Dòng chỉ số trắc lượng hiện ngay dưới tiêu đề bài báo — số liệu OpenAlex, KHÔNG phải AI đoán.
+// Chỉ hiện những gì tra được thật; tra không ra thì nói rõ là chưa tra được, không để trống lập lờ.
+function paperMetricsHtml(p) {
+  if (!p) return '';
+  const phan = [];
+  if (typeof p.citations === 'number') {
+    const cpy = typeof p.citationsPerYear === 'number' ? ` (${p.citationsPerYear}/năm)` : '';
+    phan.push(`<span title="Số lượt trích dẫn theo OpenAlex">📈 ${p.citations} trích dẫn${cpy}</span>`);
+  }
+  if (typeof p.authorHIndex === 'number') {
+    phan.push(`<span title="h-index của tác giả có uy tín cao nhất trong nhóm${p.authorTop ? ': ' + escHtml(p.authorTop) : ''}">👤 h-index ${p.authorHIndex}${p.authorTop ? ' · ' + escHtml(p.authorTop) : ''}</span>`);
+  }
+  if (p.year)  phan.push(`<span>📅 ${escHtml(p.year)}</span>`);
+  if (p.venue) phan.push(`<span title="Tạp chí">📖 ${escHtml(p.venue)}</span>`);
+  if (!phan.length) {
+    return `<div style="font-size:0.72rem;color:#94a3b8;margin-top:3px;">📈 Chưa tra được chỉ số trích dẫn (không tìm thấy trên OpenAlex)</div>`;
+  }
+  return `<div style="font-size:0.72rem;color:#475569;margin-top:3px;display:flex;flex-wrap:wrap;gap:10px;">${phan.join('')}</div>`;
+}
+
 function sourceTierBadgeHtml(score) {
   const c = SOURCE_TIER_COLOR[score.tier] || SOURCE_TIER_COLOR[4];
   // Tooltip nêu rõ điểm được cộng từ đâu — minh bạch để người dùng tự kiểm, không phải con số suông.
@@ -2003,6 +2068,7 @@ function renderStabilityTab() {
                   : `<span>${escHtml(p.title || '')}</span>`
                 }
               </div>
+              ${paperMetricsHtml(p)}
               ${p.url ? `<div style="font-size: 0.75rem; color: #475569; word-break: break-all;">
                 <span style="color: #4338ca; font-weight: 500;">🔗 URL:</span>
                 <a href="${escHtml(p.url)}" target="_blank" rel="noopener" style="color: #475569; text-decoration: underline;">${escHtml(p.url)}</a>

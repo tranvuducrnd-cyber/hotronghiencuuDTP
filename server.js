@@ -551,6 +551,193 @@ function repairTruncatedJson(frag) {
   return out;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// LÀM GIÀU DỮ LIỆU TRÍCH DẪN — nguồn: OpenAlex (miễn phí, không cần API key).
+//
+// Vì sao chọn OpenAlex chứ không phải Semantic Scholar: đã đo thực tế cả hai.
+// Semantic Scholar tra theo LÔ DOI thì tốt (0,86s/5 bài) nhưng tra theo TIÊU ĐỀ
+// bị chặn 429 ngay ở lần gọi thứ HAI khi không có API key — mà phần lớn bài do
+// Serper tìm được lại KHÔNG có DOI. OpenAlex gọi tiêu đề 3 lần liên tiếp vẫn
+// 200, nên dùng được cho cả hai trường hợp.
+//
+// Nguyên tắc: hàm này TUYỆT ĐỐI không được ném lỗi. Không tra được thì để trống
+// và phần chấm điểm tự động bỏ qua tiêu chí trích dẫn — thà thiếu tiêu chí còn
+// hơn hỏng cả báo cáo, và cũng không được bịa số trích dẫn.
+// ─────────────────────────────────────────────────────────────────────────────
+const OPENALEX_MAIL = 'tranvuducgt@gmail.com'; // polite pool: hạn mức cao hơn, được ưu tiên
+const _cacheTrichDan = new Map(); // khoá (doi hoặc tiêu đề) -> { data, hetHan }
+const _cacheTacGia   = new Map(); // mã tác giả OpenAlex     -> { data: {h, ten}, hetHan }
+const CACHE_TRICHDAN_TTL = 7 * 24 * 60 * 60 * 1000; // 7 ngày: số trích dẫn nhích rất chậm
+// Tra KHÔNG ra cũng phải nhớ, nếu không thì mỗi lần chạy báo cáo lại hỏi lại đúng những bài đã
+// biết chắc là không có trong OpenAlex (phần lớn là trang web thường, không phải bài báo).
+// TTL ngắn hơn vì bài mới xuất bản có thể được OpenAlex thu thập sau vài ngày.
+const CACHE_TRICHDAN_TTL_HONG = 24 * 60 * 60 * 1000; // 1 ngày
+
+function _oaUrl(path, params) {
+  const qs = Object.entries(params).map(([k, v]) => `${k}=${encodeURIComponent(v)}`).join('&');
+  return `https://api.openalex.org/${path}?${qs}&mailto=${OPENALEX_MAIL}`;
+}
+
+async function _oaFetch(url, msTimeout = 8000) {
+  const ac = new AbortController();
+  const hen = setTimeout(() => ac.abort(), msTimeout);
+  try {
+    const r = await fetch(url, { signal: ac.signal });
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; } finally { clearTimeout(hen); }
+}
+
+// Rút gọn một bản ghi OpenAlex về đúng những trường dùng để chấm điểm.
+function _rutGonWork(w) {
+  if (!w) return null;
+  return {
+    citations: typeof w.cited_by_count === 'number' ? w.cited_by_count : null,
+    year:      w.publication_year || null,
+    venue:     (w.primary_location && w.primary_location.source && w.primary_location.source.display_name) || '',
+    type:      w.type || '',
+    isOA:      !!(w.open_access && w.open_access.is_oa),
+    authorIds: (w.authorships || [])
+      .map((a) => (a.author && a.author.id ? String(a.author.id).replace('https://openalex.org/', '') : null))
+      .filter(Boolean),
+    authorNames: (w.authorships || []).map((a) => (a.author && a.author.display_name) || '').filter(Boolean),
+  };
+}
+
+// Chạy các tác vụ bất đồng bộ theo nhóm nhỏ để không bắn dồn dập vào OpenAlex.
+async function _chayTheoNhom(danhSach, soSongSong, fn) {
+  const ketQua = [];
+  for (let i = 0; i < danhSach.length; i += soSongSong) {
+    ketQua.push(...await Promise.all(danhSach.slice(i, i + soSongSong).map(fn)));
+  }
+  return ketQua;
+}
+
+/**
+ * Gắn thêm citations / year / venue / authorHIndex vào từng phần tử của `papers`.
+ * Sửa TRỰC TIẾP trên mảng truyền vào. Không trả về gì.
+ */
+async function lamGiauTrichDan(papers) {
+  if (!Array.isArray(papers) || papers.length === 0) return;
+  const t0 = Date.now();
+  try {
+    const bay = new Date().getFullYear();
+    const chuaCo = [];
+
+    // Bước 1 — lấy từ bộ nhớ đệm trước, chỉ những bài chưa có mới phải gọi mạng.
+    for (const p of papers) {
+      const khoa = (p.doi ? 'doi:' + p.doi : 'ti:' + String(p.title || '').toLowerCase()).slice(0, 300);
+      const c = _cacheTrichDan.get(khoa);
+      // c.data === null nghĩa là "đã tra rồi, chắc chắn không có" — vẫn tính là đã biết, khỏi hỏi lại.
+      if (c && c.hetHan > Date.now()) { p._oa = c.data; } else { p._khoaCache = khoa; chuaCo.push(p); }
+    }
+
+    // Bước 2 — tra theo LÔ DOI (rẻ nhất: 50 bài / 1 lần gọi).
+    const coDoi = chuaCo.filter((p) => p.doi);
+    for (let i = 0; i < coDoi.length; i += 50) {
+      const lo = coDoi.slice(i, i + 50);
+      const j = await _oaFetch(_oaUrl('works', { filter: 'doi:' + lo.map((p) => p.doi).join('|'), 'per-page': 50 }));
+      const theoDoi = new Map();
+      for (const w of (j && j.results) || []) {
+        if (w.doi) theoDoi.set(String(w.doi).replace(/^https?:\/\/doi\.org\//i, '').toLowerCase(), w);
+      }
+      for (const p of lo) {
+        const w = theoDoi.get(String(p.doi).toLowerCase());
+        if (w) p._oa = _rutGonWork(w);
+      }
+    }
+
+    // Bước 3 — bài không có DOI (hoặc DOI tra không ra): tra theo tiêu đề, 5 luồng song song.
+    // Chỉ nhận kết quả khi tiêu đề khớp đủ gần, tránh gán nhầm số trích dẫn của bài khác.
+    const canTraTen = chuaCo.filter((p) => !p._oa && String(p.title || '').length >= 15);
+    await _chayTheoNhom(canTraTen, 5, async (p) => {
+      const j = await _oaFetch(_oaUrl('works', { filter: 'title.search:' + String(p.title).slice(0, 220), 'per-page': 1 }));
+      const w = j && j.results && j.results[0];
+      if (!w) return;
+      const chuanHoa = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+      const a = chuanHoa(p.title), b = chuanHoa(w.display_name);
+      // Điều kiện khớp: một bên chứa trọn bên kia, hoặc trùng ≥70% số từ (≥4 ký tự) của tiêu đề gốc.
+      let khop = a === b || a.includes(b) || b.includes(a);
+      if (!khop) {
+        const tuA = a.split(' ').filter((t) => t.length >= 4);
+        const setB = new Set(b.split(' '));
+        khop = tuA.length >= 3 && tuA.filter((t) => setB.has(t)).length / tuA.length >= 0.7;
+      }
+      if (khop) p._oa = _rutGonWork(w);
+    });
+
+    // Bước 4 — h-index tác giả: gom TẤT CẢ mã tác giả rồi hỏi một lần theo lô.
+    // Đệm riêng cho tác giả, nếu không thì dù bài đã nằm trong đệm vẫn phải gọi lại bước này.
+    const moiId = new Set();
+    for (const p of papers) for (const id of (p._oa && p._oa.authorIds) || []) moiId.add(id);
+    const bangH = new Map();
+    const canHoi = [];
+    for (const id of moiId) {
+      const c = _cacheTacGia.get(id);
+      if (c && c.hetHan > Date.now()) bangH.set(id, c.data); else canHoi.push(id);
+    }
+    for (let i = 0; i < canHoi.length; i += 50) {
+      const lo = canHoi.slice(i, i + 50);
+      const j = await _oaFetch(_oaUrl('authors', { filter: 'openalex_id:' + lo.join('|'), 'per-page': 50 }));
+      for (const a of (j && j.results) || []) {
+        const id = String(a.id || '').replace('https://openalex.org/', '');
+        if (!id || !a.summary_stats) continue;
+        const t = { h: a.summary_stats.h_index || 0, ten: a.display_name || '' };
+        bangH.set(id, t);
+        _cacheTacGia.set(id, { data: t, hetHan: Date.now() + CACHE_TRICHDAN_TTL });
+      }
+    }
+
+    // Bước 5 — chốt số liệu lên từng bài + ghi vào bộ nhớ đệm.
+    for (const p of papers) {
+      const oa = p._oa;
+      if (!oa) {
+        if (p._khoaCache) _cacheTrichDan.set(p._khoaCache, { data: null, hetHan: Date.now() + CACHE_TRICHDAN_TTL_HONG });
+        delete p._khoaCache;
+        continue;
+      }
+      let hMax = null, tacGiaTop = '';
+      for (const id of oa.authorIds) {
+        const t = bangH.get(id);
+        if (t && (hMax === null || t.h > hMax)) { hMax = t.h; tacGiaTop = t.ten; }
+      }
+      p.citations   = oa.citations;
+      p.year        = oa.year || p.year;
+      p.venue       = oa.venue;
+      p.pubType     = oa.type;
+      p.isOA        = oa.isOA;
+      p.authorHIndex = hMax;
+      p.authorTop    = tacGiaTop;
+      p.authors      = p.authors || oa.authorNames.slice(0, 3).join(', ');
+      // Trích dẫn/năm — so bài mới với bài cũ mới công bằng. Bài ra năm nay: chia cho 1.
+      if (typeof oa.citations === 'number' && oa.year) {
+        p.citationsPerYear = +(oa.citations / Math.max(1, bay - oa.year + 1)).toFixed(2);
+      }
+      if (p._khoaCache) {
+        _cacheTrichDan.set(p._khoaCache, { data: oa, hetHan: Date.now() + CACHE_TRICHDAN_TTL });
+        delete p._khoaCache;
+      }
+    }
+    for (const p of papers) delete p._oa;
+
+    const soCo = papers.filter((p) => typeof p.citations === 'number').length;
+    console.log(`[OpenAlex] Làm giàu trích dẫn: ${soCo}/${papers.length} bài, ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  } catch (e) {
+    console.error('[OpenAlex] Bỏ qua làm giàu trích dẫn:', e.message);
+  }
+}
+
+// Gói bài báo gửi về trình duyệt — bỏ `body` (rất nặng), giữ các trường dùng để chấm điểm.
+function rutGonBaiBao(p) {
+  return {
+    title: p.title, url: p.url, doi: p.doi, year: p.year, authors: p.authors, source: p.source,
+    hasBody: p.body && p.body.length > 500,
+    citations: p.citations, citationsPerYear: p.citationsPerYear,
+    authorHIndex: p.authorHIndex, authorTop: p.authorTop,
+    venue: p.venue, pubType: p.pubType, isOA: p.isOA,
+  };
+}
+
 function safeParseJSON(text) {
   let cleaned = String(text == null ? '' : text).trim();
   // Nếu AI bọc JSON trong markdown code fence, chỉ lấy đúng phần bên trong fence đầu tiên
@@ -1715,6 +1902,16 @@ Trình bày theo cấu trúc JSON:
     updateProgress(searchId, 'stability', 75, useOnlineDeg
       ? 'Nguồn nội bộ hạn chế — DeepSeek đang tự tìm & đọc bài báo qua web...'
       : 'Đang gửi yêu cầu phân tích tổng hợp tới OpenAI...');
+
+    // Tra trích dẫn CHẠY SONG SONG với AI, không xếp hàng chờ sau. Hai việc này độc lập hoàn
+    // toàn: mảng `papers` đã chốt xong từ trước, còn OpenAlex thì không liên quan gì tới OpenAI.
+    // Chờ AI vốn đã mất hàng chục giây, nên phần tra trích dẫn (~5s) nấp trọn trong khoảng đó và
+    // người dùng KHÔNG phải đợi thêm. Cố tình không `await` ở đây; bắt lỗi sẵn để tránh
+    // unhandled rejection nếu nó hỏng trước khi tới chỗ `await` bên dưới.
+    const viecTrichDan = lamGiauTrichDan(papers).catch((e) => {
+      console.error('[OpenAlex] lỗi nền:', e.message);
+    });
+
     const [text, phText] = await Promise.all([
       callOpenAIVerified(openaiKey, [
         { role: 'system', content: degSystemMsg },
@@ -1726,6 +1923,10 @@ Trình bày theo cấu trúc JSON:
       ])
     ]);
 
+    // Đến đây gần như chắc chắn đã xong từ lâu (AI lâu hơn nhiều), chỉ chờ cho chắc.
+    updateProgress(searchId, 'stability', 93, 'Đang tra số lượt trích dẫn và uy tín tác giả...');
+    await viecTrichDan;
+
     updateProgress(searchId, 'stability', 95, 'Đang xử lý kết quả trả về từ AI...');
     try {
       const parsed       = safeParseJSON(text);
@@ -1736,13 +1937,13 @@ Trình bày theo cấu trúc JSON:
         parsed.stablePhRange = phParsed;
       }
       
-      parsed.rawPapers   = papers.map((p) => ({ title: p.title, url: p.url, doi: p.doi, year: p.year, authors: p.authors, source: p.source, hasBody: p.body && p.body.length > 500 }));
+      parsed.rawPapers   = papers.map(rutGonBaiBao);
       parsed.searchMode  = searchMode;
       updateProgress(searchId, 'stability', 100, 'Hoàn thành.');
       res.json(parsed);
     } catch {
       updateProgress(searchId, 'stability', 100, 'Hoàn thành.');
-      res.json({ raw: text, rawPapers: papers.map((p) => ({ title: p.title, url: p.url, doi: p.doi, year: p.year, authors: p.authors, source: p.source, hasBody: p.body && p.body.length > 500 })), searchMode });
+      res.json({ raw: text, rawPapers: papers.map(rutGonBaiBao), searchMode });
     }
   } catch (err) {
     updateProgress(searchId, 'stability', 100, 'Lỗi tiến trình.');
