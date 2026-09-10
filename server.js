@@ -3027,6 +3027,8 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
   const { drugName, dosageForm } = req.body;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
   const serperKey = req.body.serperKey || process.env.SERPER_API_KEY;
+  const _t0 = Date.now();
+  const _moc = (ten) => console.log(`[Timing] ${ten}: ${((Date.now() - _t0) / 1000).toFixed(1)}s`);
   batDauNganSachSerper(420);   // 7 phút — đủ rộng vì các lượt gọi Serper chạy song song
   if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
@@ -3064,6 +3066,7 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
       });
     }
 
+    _moc(`tìm ứng viên xong (${candidates.length} patent)`);
     // BƯỚC 2 — xác minh TỪNG ứng viên. Orange Book đã là nguồn chính thức nên bỏ qua bước đối chiếu.
     //
     // CHIA LÔ NHỎ CÓ GIÃN CÁCH — không được dùng Promise.all cho tất cả: bắn ~30 request cùng lúc
@@ -3085,6 +3088,7 @@ app.post('/api/product-selection/originator-patent', requireApprovedUser, async 
       if (i + VERIFY_BATCH < candidates.length) await delay(900);
     }
 
+    _moc('xác minh xong');
     const verifiedList = [];
     const rejectedList = [];
     const unverifiedList = [];
@@ -3140,6 +3144,29 @@ NHIỆM VỤ:
      (b) Trường "brand" PHẢI LÀ TÊN THƯƠNG HIỆU THẬT (trademark) — TUYỆT ĐỐI KHÔNG được điền tên
          hoạt chất/INN (vd không được điền "Propofol" hay "Paracetamol" làm brand — nếu không biết
          brand thật của công ty đó thì KHÔNG liệt kê công ty đó vào "originators").
+
+   PHÂN BIỆT HÃNG PHÁT MINH với HÃNG ĐƯỢC CẤP PHÉP PHÂN PHỐI — đây là lỗi rất hay mắc:
+     - Nhiều thuốc do hãng A phát minh và sở hữu thương hiệu, nhưng hãng B được CẤP PHÉP bán ở một
+       thị trường nhất định. Hãng B KHÔNG phải hãng phát minh.
+     - Ví dụ có thật: Glucophage (metformin) do Aron Laboratories (Pháp) ra mắt 1959, chuyển sang
+       Lipha, rồi Lipha được Merck KGaA mua — nên MERCK mới là hãng phát minh và sở hữu thương hiệu
+       Glucophage toàn cầu. Bristol-Myers Squibb CHỈ được cấp phép bán tại MỸ từ 1995.
+       Ghi "Bristol-Myers Squibb — Glucophage (Global)" là SAI cả về vai trò lẫn phạm vi.
+     - Khi liệt kê, ưu tiên hãng PHÁT MINH GỐC và bên KẾ THỪA THƯƠNG HIỆU. Nếu vẫn muốn nêu bên được
+       cấp phép, phải ghi rõ trong "company" (vd "Bristol-Myers Squibb (được cấp phép phân phối)")
+       và "region" đúng phạm vi thật (vd "Mỹ"), KHÔNG được ghi "Global".
+     - Trường "region" phải phản ánh phạm vi THẬT của công ty đó, không mặc định ghi "Global".
+
+   BẮT BUỘC NÊU ĐỦ CHUỖI LỊCH SỬ, KỂ CẢ PHÁP NHÂN ĐÃ BIẾN MẤT:
+     - Patent mang tên pháp nhân NỘP ĐƠN TẠI THỜI ĐIỂM NỘP, không phải tên chủ sở hữu hiện nay.
+       Thuốc càng cũ thì tên trên patent càng khác tên hãng bây giờ.
+     - Vì vậy trường "company" phải ghi ĐỦ chuỗi kế thừa theo thứ tự thời gian, bắt đầu từ pháp nhân
+       ĐẦU TIÊN nộp đơn: "Aron Laboratories -> Lipha -> Merck KGaA", "Sterling Drug -> SmithKline
+       Beecham -> GSK", "Warner-Lambert -> Pfizer".
+     - KHÔNG được chỉ ghi mỗi tên hãng hiện tại. Nếu chỉ ghi "Merck KGaA" thì các patent gốc đứng tên
+       "Lipha SA" hay "Aron" sẽ bị hệ thống hiểu nhầm là của hãng khác và bị loại oan.
+     - Cả tên công ty con, chi nhánh nghiên cứu, pháp nhân sở hữu sáng chế riêng cũng nên nêu nếu biết
+       (vd "Bayer AG / Bayer Intellectual Property GmbH", "GlaxoSmithKline LLC / Glaxo Group Ltd").
    TUYỆT ĐỐI KHÔNG liệt kê các hãng SẢN XUẤT GENERIC — dù công ty đó CÓ patent bào chế riêng (patent
    công thức/dạng bào chế do hãng generic tự phát triển SAU KHI hoạt chất đã hết bảo hộ hoàn toàn
    KHÔNG làm công ty đó trở thành "hãng phát minh"). Dấu hiệu nhận biết hãng generic: chỉ bán ở 1
@@ -3152,7 +3179,20 @@ NHIỆM VỤ:
      SmithKline Beecham -> GSK"), "brand" (thương hiệu THẬT), "region" (khu vực/thị trường chính).
    - CHỈ liệt kê dòng có căn cứ hợp lý; không bịa chuỗi M&A không có thật. Thà liệt kê THIẾU còn hơn
      liệt kê SAI (thêm nhầm hãng generic vào danh sách hãng phát minh).
-2. Với MỖI patent trong danh sách: xác định "isFormulation" (true nếu là patent DẠNG BÀO CHẾ — công thức, dạng tinh thể/polymorph, bao phim, giải phóng kiểm soát, quy trình sản xuất; false nếu là patent hợp chất cơ bản/phương pháp điều trị/không liên quan bào chế), "patentType" (Dạng tinh thể|Công thức bào chế|Bao phim|Giải phóng kiểm soát|Quy trình sản xuất|Khác), "status" (còn hạn|hết hạn|không rõ).
+2. Với MỖI patent, xác định "isFormulation" — CHỈ true khi patent nói về THUỐC THÀNH PHẨM (dạng bào chế):
+   ĐÚNG là dạng bào chế (isFormulation = true):
+     - Công thức bào chế: thành phần tá dược, tỉ lệ phối hợp, viên nén/viên nang/dung dịch/hỗn dịch/thuốc tiêm
+     - Kỹ thuật bào chế: bao phim, bao tan trong ruột, giải phóng kéo dài/kiểm soát, vi nang, hệ phân tán rắn
+     - Quy trình SẢN XUẤT THUỐC THÀNH PHẨM: dập viên, tạo hạt, đóng nang
+   KHÔNG PHẢI dạng bào chế (isFormulation = false) — đây là điểm hay bị nhầm nhất:
+     - DẠNG TINH THỂ / POLYMORPH / dạng vô định hình / muối / hydrat / solvat / đồng tinh thể
+       → đây là đặc tính của NGUYÊN LIỆU hoạt chất, KHÔNG phải công thức thuốc thành phẩm
+     - Hợp chất hoá học, dẫn xuất mới, quy trình TỔNG HỢP hoạt chất
+     - Phương pháp điều trị, chỉ định mới, liều dùng
+     - Thiết bị, dụng cụ, bao bì
+   Dấu hiệu nhận biết nhanh: tiêu đề chỉ ghi "Polymorphs", "Crystalline form of...", "Salt of...",
+   "Process for preparing <tên hoạt chất>" → gần như chắc chắn KHÔNG phải dạng bào chế.
+   Kèm "patentType" (Công thức bào chế|Bao phim|Giải phóng kiểm soát|Quy trình sản xuất thành phẩm|Dạng tinh thể|Hợp chất|Phương pháp điều trị|Khác), "status" (còn hạn|hết hạn|không rõ).
 3. Với MỖI patent, xác định thêm "sameAsOriginator": chủ sở hữu (phần cuối mỗi dòng, sau dấu "—") có thuộc một trong các dòng hãng gốc ở mục 1 không?
    - QUAN TRỌNG: tên chủ sở hữu có thể viết bằng chữ KHÔNG PHẢI LATIN hoặc dạng phiên âm — phải nhận ra chúng là cùng một công ty. Ví dụ: "워너-램버트 캄파니" (Hàn) = "Warner-Lambert Company"; "Плива Кроэйша Лтд." (Nga) = "Pliva Croatia Ltd"; tên chữ Hán/Nhật tương tự.
    - true = đúng là hãng gốc (hoặc công ty con/bên kế thừa hợp pháp của hãng gốc).
@@ -3162,7 +3202,10 @@ TUYỆT ĐỐI KHÔNG thêm patent nào ngoài danh sách được cho. CHỈ d�
 Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"overallNote":"...","items":{"<patentNumber>":{"isFormulation":true,"patentType":"...","status":"...","sameAsOriginator":true}}}`,
         },
         { role: 'user', content: `Hoạt chất: "${drugName}"${dosageForm ? `, dạng bào chế: "${dosageForm}"` : ''}.\n\nDanh sách patent đã xác minh:\n${listText}` },
-      ], 'deepseek/deepseek-chat', 3, 4000);
+        // Gemini 2.5 Flash thay cho DeepSeek Chat: đo trên đúng khối lượng này (prompt dài + 29
+        // patent + trả JSON) được 7,6s so với 70s — nhanh gấp 9 lần mà vẫn phân loại đủ 29/29.
+        // Bước này từng chiếm 67% tổng thời gian tra cứu (95 trong 142 giây).
+      ], 'google/gemini-2.5-flash', 3, 4000);
 
       // AI đôi khi trả JSON "thành công" (không lỗi HTTP) nhưng thiếu hẳn "originators" — hiện
       // tượng thoáng qua đã gặp thực tế (không phải do bị cắt token, đã kiểm bằng log: field này
@@ -3189,6 +3232,7 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
       }
     }
 
+    _moc('AI phân loại xong');
     // BƯỚC 4 — lọc theo "chỉ patent dạng bào chế" (yêu cầu đã chốt) + gắn patentType/status.
     // Patent nào AI không phân loại được (lỗi/không có trong "items") vẫn GIỮ (không âm thầm bỏ),
     // đánh dấu patentType mặc định để người dùng tự đánh giá thay vì mất dữ liệu.
@@ -3213,10 +3257,17 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
         ownerMatchBy = 'ai';
       }
 
+      // Lưới chặn bằng CODE, không phụ thuộc AI: tiêu đề patent nói rõ về dạng tinh thể/muối/
+      // tổng hợp hoạt chất thì chắc chắn KHÔNG phải patent dạng bào chế, dù AI có gắn nhãn gì.
+      // Đã gặp thật: 3 patent tiêu đề vỏn vẹn "Polymorphs" của Boehringer Ingelheim vẫn lọt vào
+      // danh sách dạng bào chế.
+      const tieuDe = String(p.realTitle || p.title || '').toLowerCase();
+      const laKhongPhaiBaoChe = /polymorph|crystalline form|crystal form|amorphous form|\bco-?crystal|salt of |hydrate of |solvate of |process for (?:the )?(?:preparation|preparing|synthesis)|synthesis of/.test(tieuDe);
+
       return Object.assign({}, p, {
-        patentType: cls?.patentType || 'Chưa phân loại',
+        patentType: laKhongPhaiBaoChe ? 'Dạng tinh thể/nguyên liệu' : (cls?.patentType || 'Chưa phân loại'),
         status: cls?.status || '',
-        isFormulation: cls ? !!cls.isFormulation : true, // không rõ -> vẫn giữ, coi là có thể liên quan
+        isFormulation: laKhongPhaiBaoChe ? false : (cls ? !!cls.isFormulation : true), // không rõ -> vẫn giữ
         ownerMatch,
         ownerMatchBy,
         // CHỈ ẩn khi kết luận CHẮC CHẮN là hãng khác. Trạng thái 'unknown' được GIỮ LẠI kèm nhãn —
@@ -3228,8 +3279,11 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
     // được là của hãng KHÁC thì loại hẳn khỏi danh sách chính (không chỉ cảnh báo như trước).
     // Patent chưa xác định được applicant (vd Google Patents đang chặn tạm) vẫn GIỮ — không đủ căn
     // cứ để khẳng định "không phải hãng gốc" nên loại oan sẽ mất dữ liệu thật một cách vô lý.
-    const classified = [...verifiedList.map(applyClassification), ...unverifiedList.map(applyClassification)]
-      .filter((p) => p.isFormulation);
+    const daPhanLoai = [...verifiedList.map(applyClassification), ...unverifiedList.map(applyClassification)];
+    const classified = daPhanLoai.filter((p) => p.isFormulation);
+    // Giữ lại để hiện gọn cho người dùng biết đã loại gì — không âm thầm bỏ mất dữ liệu.
+    const nonFormulationPatents = daPhanLoai.filter((p) => !p.isFormulation)
+      .map((p) => ({ patentNumber: p.patentNumber, realTitle: p.realTitle, patentType: p.patentType, applicant: p.applicant }));
     let nonOriginatorPatents = classified.filter((p) => p.differentCompany);
     let anHet = false;
     // LƯỚI AN TOÀN: nếu lọc xong KHÔNG còn patent nào thì gần như chắc chắn AI đã xác định thiếu
@@ -3252,7 +3306,8 @@ Trả JSON: {"originators":[{"company":"...","brand":"...","region":"..."}],"ove
       formulationPatents: finalVerified,
       unverifiedPatents: finalUnverified,
       rejectedPatents: rejectedList,
-      loBoLocHang: anHet,   // báo cho giao diện biết bộ lọc hãng gốc đã bị bỏ qua
+      loBoLocHang: anHet,
+      nonFormulationPatents,   // báo cho giao diện biết bộ lọc hãng gốc đã bị bỏ qua
       nonOriginatorPatents: nonOriginatorPatents.map((p) => ({ patentNumber: p.patentNumber, applicant: p.applicant, realTitle: p.realTitle })),
       overallNote: classification.overallNote || '',
       googlePatentsUrl: `https://patents.google.com/?q=${encodeURIComponent(drugName)}+formulation`,

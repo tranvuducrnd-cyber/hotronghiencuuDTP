@@ -3492,6 +3492,11 @@ async function pselFindOriginator() {
           <div class="mt-2 text-2">${escHtml(d.overallNote || 'Không xác định được patent dạng bào chế rõ ràng cho hoạt chất này.')}</div>
           ${pselRejectedHtml(d.rejectedPatents)}
           ${pselNonOriginatorHtml(d.nonOriginatorPatents)}
+      ${(d.nonFormulationPatents || []).length ? `<div class="insight-box mt-2">
+        <div class="insight-label">ℹ️ Đã ẩn ${d.nonFormulationPatents.length} patent KHÔNG phải dạng bào chế</div>
+        <div class="text-sm text-3" style="margin-bottom:.4rem">Dạng tinh thể/polymorph, muối, quy trình tổng hợp hoạt chất — là đặc tính nguyên liệu, không phải công thức thuốc thành phẩm.</div>
+        ${d.nonFormulationPatents.map((p) => `<div class="text-sm mt-1"><span class="mono">${escHtml(p.patentNumber || '')}</span> — ${escHtml(p.patentType || '')}${p.realTitle ? `<br><span class="text-3">${escHtml(p.realTitle)}</span>` : ''}</div>`).join('')}
+      </div>` : ''}
           <div class="mt-2"><a href="${escHtml(d.googlePatentsUrl)}" target="_blank" rel="noopener">🔗 Tự tra trên Google Patents</a></div>
         </div>`;
       return;
