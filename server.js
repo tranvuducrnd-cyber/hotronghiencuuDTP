@@ -6,6 +6,12 @@ const { PDFParse } = require('pdf-parse');
 const { createClient } = require('@supabase/supabase-js');
 const docx = require('docx');
 const helmet = require('helmet');
+const bhyt = require('./bhyt');
+const davsdk = require('./davsdk');
+const indiaban = require('./indiaban');
+const thamchieu = require('./thamchieu');
+const refformula = require('./refformula');
+const { latexToPlain, sanDeep } = require('./latex');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -112,6 +118,22 @@ app.post('/api/admin/set-password', requireApprovedUser, requireAdmin, async (re
     const { error } = await supabaseAdmin.auth.admin.updateUserById(userId, { password: newPassword });
     if (error) return res.status(400).json({ error: error.message });
     res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Đánh dấu 1 góp ý là đã xử lý. Dùng supabaseAdmin (né RLS) — bảng `suggestions` CỐ TÌNH không
+// có policy update cho người dùng thường, nên mọi thao tác đổi trạng thái phải đi qua đây, nơi
+// requireAdmin đã kiểm chắc chắn người gọi là admin trước khi chạm vào dữ liệu.
+app.post('/api/admin/suggestions/:id/complete', requireApprovedUser, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const { error } = await supabaseAdmin.from('suggestions')
+      .update({ status: 'done', completed_at: new Date().toISOString(), completed_by: req.user.id })
+      .eq('id', id);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ ok: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -386,8 +408,20 @@ async function fetchText(url, title = '') {
 // header HTTP-Referer/X-Title, và tên model phải có tiền tố nhà cung cấp (vd: "openai/gpt-5-nano").
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-async function callOpenAI(apiKey, messages, model = 'openai/gpt-5-nano', retries = 3, maxTokens = 16000) {
-  for (let i = 0; i < retries; i++) {
+// Hạn chế số lời gọi OpenRouter đồng thời (mặc định 2): trang báo cáo khả thi chạy nhiều tác vụ AI cùng lúc
+// nên hay dính 429 (rate limit). Lời gọi dư được xếp hàng chờ; thời gian chờ 429 vẫn giữ chỗ nên không dồn thêm.
+const OR_TOI_DA = Math.max(1, Number(process.env.OPENROUTER_MAX_CONCURRENT) || 2);
+let _orDangChay = 0;
+const _orHangDoi = [];
+async function callOpenAI(...args) {
+  if (_orDangChay >= OR_TOI_DA) await new Promise((r) => _orHangDoi.push(r));
+  _orDangChay++;
+  try { return await callOpenAIRaw(...args); }
+  finally { _orDangChay--; const ke = _orHangDoi.shift(); if (ke) ke(); }
+}
+async function callOpenAIRaw(apiKey, messages, model = 'openai/gpt-5-nano', retries = 3, maxTokens = 16000) {
+  // Lỗi 429 (nhà cung cấp giới hạn tốc độ) được thử thêm tối đa 2 lần nữa với thời gian chờ tăng dần.
+  for (let i = 0; i < retries + 2; i++) {
     try {
       const res = await axios.post(
         OPENROUTER_URL,
@@ -416,8 +450,8 @@ async function callOpenAI(apiKey, messages, model = 'openai/gpt-5-nano', retries
       return res.data.choices[0].message.content;
     } catch (e) {
       const is429 = e.response && e.response.status === 429;
-      if (i === retries - 1) throw e;
-      const waitMs = is429 ? (i + 1) * 8000 : 2000; // 429: chờ 8s, 16s, 24s
+      if (is429 ? i >= retries + 1 : i >= retries - 1) throw e;
+      const waitMs = is429 ? (i + 1) * 8000 : 2000; // 429: chờ 8s, 16s, 24s, 32s
       console.error(`OpenRouter error (${e.message}). ${is429 ? '429 rate limit, ' : ''}Retrying in ${waitMs/1000}s... (${i+1}/${retries})`);
       await new Promise(resolve => setTimeout(resolve, waitMs));
     }
@@ -812,10 +846,11 @@ function isRealJsonResponse(axiosRes) {
   return axiosRes && axiosRes.data !== null && typeof axiosRes.data === 'object';
 }
 
-app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
-  const { drugName } = req.body;
-  if (!drugName) return res.status(400).json({ valid: false, error: 'Thiếu tên hoạt chất' });
-
+// Xác thực MỘT tên hoạt chất. Tách ra thành hàm riêng để thuốc phối hợp xác thực được
+// từng chất một — gửi cả cụm "Paracetamol + Ibuprofen" vào PubChem thì luôn 404 (đã kiểm),
+// khiến thuốc phối hợp nào cũng bị báo "không tìm thấy hoạt chất".
+// Nội dung bên trong giữ NGUYÊN logic cũ, chỉ đổi từ biến ngoài thành tham số.
+async function xacThucMotHoatChat(drugName) {
   try {
     // Chạy song song cả 3 nguồn (thay vì tuần tự) để giảm thời gian chờ tối đa từ ~24s xuống ~6s
     const [exactRes, autoRes, chemblRes] = await Promise.allSettled([
@@ -830,7 +865,7 @@ app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
     const pubchemBlocked = !exactOk && !autoOk && (exactRes.status === 'fulfilled' || autoRes.status === 'fulfilled');
 
     if (exactOk && exactRes.value.data?.IdentifierList?.CID?.length > 0) {
-      return res.json({ valid: true, cid: exactRes.value.data.IdentifierList.CID[0] });
+      return ({ valid: true, cid: exactRes.value.data.IdentifierList.CID[0] });
     }
 
     // PubChem là nguồn nhận diện tên tốt nhất, nhưng khi nó không dùng được (bị chặn/lỗi) thì
@@ -846,7 +881,7 @@ app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
         const names = [m.pref_name, ...(m.molecule_synonyms || []).map((s) => s.molecule_synonym)]
           .filter(Boolean).map((x) => String(x).trim().toUpperCase());
         if (names.includes(wanted)) {
-          return res.json({ valid: true, chemblId: m.molecule_chembl_id, matchedVia: 'chembl' });
+          return ({ valid: true, chemblId: m.molecule_chembl_id, matchedVia: 'chembl' });
         }
       }
     }
@@ -874,19 +909,37 @@ app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
     // Cả PubChem lẫn ChEMBL đều đang gặp sự cố (không phải "không tìm thấy" thật, mà là KHÔNG XÁC
     // MINH ĐƯỢC) — không chặn người dùng bằng cảnh báo sai, cho tiếp tục như khi lỗi mạng hoàn toàn.
     if (pubchemBlocked && !chemblOk) {
-      return res.json({
+      return ({
         valid: true,
         sourceIssue: true,
         warning: 'PubChem/ChEMBL đang tạm gặp sự cố (có thể do giới hạn tần suất truy vấn từ IP này) — không thể xác minh chắc chắn tên hoạt chất lúc này. Đã tự động cho tiếp tục tra cứu.',
       });
     }
 
-    return res.json({ valid: false, suggestions: suggestions.slice(0, 8) });
+    return ({ valid: false, suggestions: suggestions.slice(0, 8) });
   } catch (err) {
     // Nếu tất cả API đều lỗi, cho phép tiếp tục (không chặn user)
     console.error('[Validate] Error:', err.message);
-    return res.json({ valid: true, warning: 'Không thể xác minh tên hoạt chất, tiếp tục tìm kiếm.' });
+    return ({ valid: true, warning: 'Không thể xác minh tên hoạt chất, tiếp tục tìm kiếm.' });
   }
+}
+
+app.post('/api/validate-drug', requireApprovedUser, async (req, res) => {
+  const ds = layDanhSachHoatChat(req.body);
+  if (!ds.length) return res.status(400).json({ valid: false, error: 'Thiếu tên hoạt chất' });
+
+  // Xác thực SONG SONG từng hoạt chất: thời gian của thuốc phối hợp xấp xỉ thuốc đơn chất,
+  // không phải cộng dồn N lượt.
+  const ketQua = await Promise.all(ds.map(async (ten) => {
+    const r = await xacThucMotHoatChat(ten);
+    return Object.assign({ name: ten }, r);
+  }));
+
+  // Thuốc đơn chất: trả về ĐÚNG hình dạng cũ (valid/cid/suggestions/... ở cấp cao nhất) để
+  // phần client sẵn có không phải sửa gì. Mảng `results` là phần thêm, client mới dùng tới.
+  const chung = { valid: ketQua.every((r) => r.valid), results: ketQua };
+  if (ketQua.length === 1) return res.json(Object.assign({}, ketQua[0], chung));
+  return res.json(chung);
 });
 
 // ── Tra cứu giá thuốc Việt Nam (giá kê khai / giá trúng thầu) ─────────────────
@@ -1039,6 +1092,35 @@ function applyDrugKeywordFilter(query, keywords) {
     query = query.or(`ten_thuoc.ilike.%${kw}%,hoat_chat.ilike.%${kw}%`);
   });
   return query;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DANH SÁCH HOẠT CHẤT — dùng chung cho MỌI endpoint của trang protocol nghiên cứu.
+//
+// Trang protocol cho nhập từng hoạt chất vào một ô riêng nên client gửi lên mảng
+// `drugNames`. Nhưng vẫn phải nhận được `drugName` dạng chuỗi vì:
+//   - Lịch sử tra cứu đã lưu `drug_name` là MỘT chuỗi (không đổi schema bảng),
+//   - các lượt gọi cũ / endpoint thứ cấp vẫn gửi chuỗi.
+// Khi chỉ có chuỗi thì tách bằng ĐÚNG `splitDrugKeywords` ở trên — không viết
+// logic tách thứ hai, để hành vi của trang protocol và trang tra giá giống hệt nhau.
+// ─────────────────────────────────────────────────────────────────────────────
+function layDanhSachHoatChat(body) {
+  const b = body || {};
+  if (Array.isArray(b.drugNames)) {
+    const ds = b.drugNames.map((s) => String(s == null ? '' : s).trim()).filter(Boolean).slice(0, 5);
+    if (ds.length) return ds;
+  }
+  const ds = splitDrugKeywords(b.drugName);
+  // splitDrugKeywords bỏ token < 2 ký tự; nếu bỏ sạch thì vẫn giữ nguyên chuỗi gốc để
+  // không tự ý làm rỗng đầu vào của người dùng.
+  if (ds.length) return ds;
+  const raw = String(b.drugName == null ? '' : b.drugName).trim();
+  return raw ? [raw] : [];
+}
+
+// Chuỗi ghép để đưa vào prompt, tiêu đề, tên file: "Paracetamol + Ibuprofen".
+function ghepTenHoatChat(ds) {
+  return (Array.isArray(ds) ? ds : []).join(' + ');
 }
 
 function priceTableOf(type) {
@@ -1354,76 +1436,113 @@ app.post('/api/price/upload', requireApprovedUser, requireAdmin, async (req, res
 
 // ── Route: ChEMBL Properties ──────────────────────────────────────────────────
 
+// Xác định ĐÚNG phân tử qua PubChem (tên → CID → InChIKey). Trước đây lấy kết quả đầu của ChEMBL full-text search
+// nên "paracetamol" ra nhầm 4-hydroxyphenylurea (C7H8N2O2) thay vì acetaminophen (C8H9NO2).
+async function pubchemTheoTen(ten) {
+  const w = String(ten || '').trim().split(/[\s,;(]+/)[0];
+  const ung = [...new Set([String(ten).trim(), w, /e$/i.test(w) ? '' : w + 'e', w.replace(/in$/i, 'ine')].filter((x) => x && x.length >= 3))];
+  for (const q of ung) {
+    try {
+      const r = await axios.get(`https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(q)}/property/MolecularFormula,MolecularWeight,CanonicalSMILES,IsomericSMILES,InChIKey,IUPACName,XLogP,TPSA,HBondDonorCount,HBondAcceptorCount,RotatableBondCount,Title/JSON`,
+        { timeout: 20000, headers: { 'User-Agent': 'DrugResearchPro/1.0' } });
+      const p = r.data && r.data.PropertyTable && r.data.PropertyTable.Properties && r.data.PropertyTable.Properties[0];
+      if (p && p.InChIKey) return Object.assign({ truyVan: q }, p);
+    } catch (e) { /* thử cách viết khác */ }
+  }
+  return null;
+}
+const blockDau = (k) => String(k || '').slice(0, 14);
+
 app.post('/api/properties', requireApprovedUser, async (req, res) => {
   const { drugName, searchId } = req.body;
   if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
 
-  updateProgress(searchId, 'properties', 10, 'Khởi động tiến trình tra cứu ChEMBL...');
+  updateProgress(searchId, 'properties', 10, 'Đang xác định cấu trúc phân tử (PubChem)...');
 
   try {
-    updateProgress(searchId, 'properties', 20, 'Đang tìm kiếm hoạt chất trên ChEMBL...');
-    const searchData = await get('https://www.ebi.ac.uk/chembl/api/data/molecule/search.json', {
-      q: drugName, limit: 1,
-    });
-    const molecules = searchData.molecules || [];
-    if (!molecules.length) {
-      updateProgress(searchId, 'properties', 100, 'Không tìm thấy hoạt chất trên ChEMBL.');
-      return res.status(404).json({ error: `Không tìm thấy "${drugName}" trong ChEMBL` });
+    const pc = await pubchemTheoTen(drugName);
+    updateProgress(searchId, 'properties', 25, 'Đang tìm hoạt chất trên ChEMBL...');
+    let mol = null;
+    // 1) khớp ChEMBL theo InChIKey của PubChem (chính xác tuyệt đối khối đầu = cùng cấu trúc)
+    if (pc && pc.InChIKey) {
+      try {
+        const d1 = await get('https://www.ebi.ac.uk/chembl/api/data/molecule.json', { molecule_structures__standard_inchi_key: pc.InChIKey, limit: 1 });
+        mol = (d1.molecules || [])[0] || null;
+      } catch (e) { /* thử cách khác */ }
+      if (!mol) {
+        try {
+          const d1b = await get('https://www.ebi.ac.uk/chembl/api/data/molecule.json', { molecule_structures__standard_inchi_key__startswith: blockDau(pc.InChIKey), limit: 5 });
+          mol = (d1b.molecules || []).find((m) => blockDau(m.molecule_structures && m.molecule_structures.standard_inchi_key) === blockDau(pc.InChIKey)) || null;
+        } catch (e) { /* thử cách khác */ }
+      }
+    }
+    // 2) không có PubChem/không khớp → tìm ChEMBL, chọn bản có tên/đồng nghĩa TRÙNG tên nhập thay vì lấy kết quả đầu
+    if (!mol) {
+      try {
+        const searchData = await get('https://www.ebi.ac.uk/chembl/api/data/molecule/search.json', { q: drugName, limit: 10 });
+        const ms = searchData.molecules || [];
+        const q = String(drugName).trim().toLowerCase();
+        const trungTen = (m) => String(m.pref_name || '').toLowerCase() === q || (m.molecule_synonyms || []).some((x) => String(x.molecule_synonym || '').toLowerCase() === q);
+        mol = ms.find((m) => trungTen(m) && m.molecule_structures) || ms.find((m) => m.molecule_structures) || ms[0] || null;
+      } catch (e) { /* ChEMBL lỗi: dùng PubChem */ }
+    }
+    if (!mol && !pc) {
+      updateProgress(searchId, 'properties', 100, 'Không tìm thấy hoạt chất.');
+      return res.status(404).json({ error: `Không tìm thấy "${drugName}" trong PubChem/ChEMBL` });
     }
 
-    const mol      = molecules[0];
-    const chemblId = mol.molecule_chembl_id;
-    const props    = mol.molecule_properties || {};
-    const structs  = mol.molecule_structures || {};
-
-    updateProgress(searchId, 'properties', 50, `Đang tải chi tiết cấu trúc cho ${chemblId}...`);
-    const [detailRes, mechRes] = await Promise.allSettled([
-      get(`https://www.ebi.ac.uk/chembl/api/data/molecule/${chemblId}.json`),
-      get('https://www.ebi.ac.uk/chembl/api/data/mechanism.json', { molecule_chembl_id: chemblId, limit: 5 }),
-    ]);
-
-    const detail     = detailRes.status === 'fulfilled' ? detailRes.value : mol;
-    const mechanisms = mechRes.status === 'fulfilled' ? (mechRes.value.mechanisms || []) : [];
-
-    const smiles = structs.canonical_smiles || '';
-
-    updateProgress(searchId, 'properties', 100, 'Đã hoàn thành tra cứu ChEMBL.');
+    const chemblId = mol && mol.molecule_chembl_id;
+    const props    = (mol && mol.molecule_properties) || {};
+    const structs  = (mol && mol.molecule_structures) || {};
+    updateProgress(searchId, 'properties', 55, chemblId ? `Đang tải chi tiết cấu trúc cho ${chemblId}...` : 'Đang tổng hợp dữ liệu PubChem...');
+    let detail = mol || {}, mechanisms = [];
+    if (chemblId) {
+      const [detailRes, mechRes] = await Promise.allSettled([
+        get(`https://www.ebi.ac.uk/chembl/api/data/molecule/${chemblId}.json`),
+        get('https://www.ebi.ac.uk/chembl/api/data/mechanism.json', { molecule_chembl_id: chemblId, limit: 5 }),
+      ]);
+      detail     = detailRes.status === 'fulfilled' ? detailRes.value : mol;
+      mechanisms = mechRes.status === 'fulfilled' ? (mechRes.value.mechanisms || []) : [];
+    }
+    // Công thức/KLPT/SMILES/InChIKey lấy theo PubChem (dạng gốc hoạt chất) khi có; ChEMBL bổ sung các chỉ số tính toán
+    const smiles = (pc && (pc.IsomericSMILES || pc.CanonicalSMILES)) || structs.canonical_smiles || '';
+    const cungCauTruc = !pc || !structs.standard_inchi_key || blockDau(structs.standard_inchi_key) === blockDau(pc.InChIKey);
+    updateProgress(searchId, 'properties', 100, 'Đã hoàn thành tra cứu cấu trúc.');
     res.json({
-      chemblId,
+      chemblId: chemblId || null,
       smiles,
-      imageUrl: `/api/image/${chemblId}?smiles=${encodeURIComponent(smiles)}`,
-      prefName: mol.pref_name || drugName,
-      moleculeType: mol.molecule_type,
-      maxPhase:     mol.max_phase,
+      imageUrl: chemblId ? `/api/image/${chemblId}?smiles=${encodeURIComponent(smiles)}` : '',
+      prefName: (pc && pc.Title) || (mol && mol.pref_name) || drugName,
+      moleculeType: mol && mol.molecule_type,
+      maxPhase:     mol && mol.max_phase,
       properties: {
-        IUPACName:          detail.iupac_name || mol.iupac_name,
-        MolecularFormula:   props.full_molformula   || props.molecular_formula,
-        MolecularWeight:    props.full_mwt          || props.mw_freebase,
-        XLogP:              props.alogp             || props.cx_logp,
-        TPSA:               props.psa,
-        HBondDonorCount:    props.hbd,
-        HBondAcceptorCount: props.hba,
-        RotatableBondCount: props.rtb,
-        Ro5Violations:      props.num_ro5_violations ?? props.ro5_violations,
+        IUPACName:          (pc && pc.IUPACName) || (detail && (detail.iupac_name || (mol && mol.iupac_name))),
+        MolecularFormula:   (pc && pc.MolecularFormula) || props.full_molformula || props.molecular_formula,
+        MolecularWeight:    (pc && pc.MolecularWeight) || props.full_mwt || props.mw_freebase,
+        XLogP:              (cungCauTruc ? props.alogp : null) ?? (pc && pc.XLogP) ?? props.cx_logp,
+        TPSA:               (cungCauTruc ? props.psa : null) ?? (pc && pc.TPSA) ?? props.psa,
+        HBondDonorCount:    (pc && pc.HBondDonorCount) ?? props.hbd,
+        HBondAcceptorCount: (pc && pc.HBondAcceptorCount) ?? props.hba,
+        RotatableBondCount: (pc && pc.RotatableBondCount) ?? props.rtb,
+        Ro5Violations:      cungCauTruc ? (props.num_ro5_violations ?? props.ro5_violations) : undefined,
         CanonicalSMILES:    smiles,
-        InChIKey:           structs.standard_inchi_key,
+        InChIKey:           (pc && pc.InChIKey) || structs.standard_inchi_key,
       },
       experimental: {
         pka: [
-          props.cx_most_apka ? `pKa (acid): ${props.cx_most_apka}` : null,
-          props.cx_most_bpka ? `pKa (base): ${props.cx_most_bpka}` : null,
+          cungCauTruc && props.cx_most_apka ? `pKa (acid): ${props.cx_most_apka}` : null,
+          cungCauTruc && props.cx_most_bpka ? `pKa (base): ${props.cx_most_bpka}` : null,
         ].filter(Boolean),
-        logD:  props.cx_logd ? [`LogD (pH7.4): ${props.cx_logd}`] : [],
-        logP:  props.cx_logp ? [`LogP: ${props.cx_logp}`]         : [],
+        logD:  cungCauTruc && props.cx_logd ? [`LogD (pH7.4): ${props.cx_logd}`] : [],
+        logP:  cungCauTruc && props.cx_logp ? [`LogP: ${props.cx_logp}`]         : [],
         mp: [], sol: [], color: [],
       },
       mechanisms,
-      synonyms: (detail.molecule_synonyms || mol.molecule_synonyms || [])
-        .slice(0, 10).map((s) => s.molecule_synonym),
-      sources: {
-        chembl: `https://www.ebi.ac.uk/chembl/compound_report_card/${chemblId}/`,
-        chemblApi: `https://www.ebi.ac.uk/chembl/api/data/molecule/${chemblId}.json`,
-      },
+      synonyms: ((detail && detail.molecule_synonyms) || (mol && mol.molecule_synonyms) || [])
+        .slice(0, 10).map((x) => x.molecule_synonym),
+      sources: Object.assign({},
+        chemblId ? { chembl: `https://www.ebi.ac.uk/chembl/compound_report_card/${chemblId}/`, chemblApi: `https://www.ebi.ac.uk/chembl/api/data/molecule/${chemblId}.json` } : {},
+        pc ? { pubchem: `https://pubchem.ncbi.nlm.nih.gov/#query=${encodeURIComponent(pc.truyVan)}` } : {}),
     });
   } catch (err) {
     updateProgress(searchId, 'properties', 100, 'Lỗi tiến trình.');
@@ -1661,7 +1780,10 @@ Trả về JSON (mỗi field có value + sourceUrl):
 
 
 app.post('/api/forced-degradation', requireApprovedUser, async (req, res) => {
-  const { drugName, searchId } = req.body;
+  const { searchId } = req.body;
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  const drugName = ghepTenHoatChat(dsHoatChat) || req.body.drugName;
+  const laPhoiHop = dsHoatChat.length > 1;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
   const serperKey = req.body.serperKey || process.env.SERPER_API_KEY;
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
@@ -1675,14 +1797,36 @@ app.post('/api/forced-degradation', requireApprovedUser, async (req, res) => {
     if (serperKey) {
       try {
         updateProgress(searchId, 'stability', 10, 'Đang gửi 6 truy vấn tìm kiếm Google...');
-        const [rawRes, phRes, ncbiRes, pdfRes, degRes, scholarRes] = await Promise.allSettled([
+        // Thuốc phối hợp: tài liệu riêng về phân hủy của CHÍNH chế phẩm phối hợp rất hiếm, nên
+        // phần lớn dữ liệu thực nghiệm dùng được vẫn đến từ nghiên cứu TỪNG hoạt chất riêng lẻ —
+        // tìm cả hai hướng thay vì chỉ tìm đúng cụm tên ghép (gần như chắc chắn 0 kết quả).
+        // LƯU Ý: serperSearch() gọi mạng NGAY khi được gọi (không phải hàm trễ), nên hai bộ truy
+        // vấn PHẢI được dựng trong 2 nhánh if/else riêng — gộp cả hai vào object rồi chọn 1 bằng
+        // ternary sẽ khiến nhánh KHÔNG dùng vẫn âm thầm bắn hết request, lãng phí hạn mức Serper.
+        const dsTruyVan = laPhoiHop ? [
+          serperSearch(`${dsHoatChat.join(' ')} forced degradation`, serperKey, 20),
+          serperSearch(`${dsHoatChat.join(' and ')} stability indicating method combination`, serperKey, 15),
+          ...dsHoatChat.flatMap((ten) => [
+            serperSearch(`${ten} forced degradation`, serperKey, 20),
+            serperSearch(`${ten} stability pH range`, serperKey, 15),
+          ]),
+        ] : [
           serperSearch(`${drugName} forced degradation`, serperKey, 40),
           serperSearch(`${drugName} stability pH range`, serperKey, 20),
           serperSearch(`site:ncbi.nlm.nih.gov ${drugName} forced degradation`, serperKey, 20),
           serperSearch(`${drugName} forced degradation filetype:pdf`, serperKey, 20),
           serperSearch(`${drugName} forced degradation impurity mechanism`, serperKey, 5),
-          serperScholar(`${drugName} forced degradation`, serperKey, 10)
-        ]);
+          serperScholar(`${drugName} forced degradation`, serperKey, 10),
+        ];
+        const ketQuaSettled = await Promise.allSettled(dsTruyVan);
+        // Đơn chất: giữ đúng 6 biến như cũ. Phối hợp: gộp hết vào organicRaw, các biến còn lại rỗng
+        // (không cần phân biệt nguồn nữa vì bước gộp+khử trùng lặp bên dưới xử lý chung).
+        const [rawRes, phRes, ncbiRes, pdfRes, degRes, scholarRes] = laPhoiHop
+          ? [{ status: 'fulfilled', value: { organic: ketQuaSettled.flatMap((r) => r.status === 'fulfilled' ? (r.value.organic || []) : []) } },
+             { status: 'fulfilled', value: { organic: [] } }, { status: 'fulfilled', value: { organic: [] } },
+             { status: 'fulfilled', value: { organic: [] } }, { status: 'fulfilled', value: { organic: [] } },
+             { status: 'fulfilled', value: { organic: [] } }]
+          : ketQuaSettled;
 
         const organicRaw = rawRes.status === 'fulfilled' ? rawRes.value.organic || [] : [];
         const organicDeg = degRes.status === 'fulfilled' ? degRes.value.organic || [] : [];
@@ -1810,7 +1954,7 @@ Nội dung chính (Abstract/Methods/Results): ${extractKeySections(p.body)}`).jo
 
     const systemMsg = `Bạn là một trợ lý tra cứu dữ liệu khoa học thực nghiệm, đọc rất kỹ và cẩn thận. Bạn KHÔNG ĐƯỢC PHÉP sử dụng kiến thức có sẵn trong bộ nhớ để tự suy đoán hoặc giải thích.
 BƯỚC 1: SÀNG LỌC VÀ ĐỐI CHIẾU DỮ LIỆU
-- Kiểm tra xem tài liệu được cung cấp có thực sự nghiên cứu về hoạt chất mục tiêu hay không. NẾU KHÔNG, LOẠI BỎ NGAY.
+- Kiểm tra xem tài liệu được cung cấp có thực sự nghiên cứu về hoạt chất mục tiêu hay không${laPhoiHop ? ` (ĐÂY LÀ CHẾ PHẨM PHỐI HỢP ${dsHoatChat.length} hoạt chất: ${dsHoatChat.join(', ')} — giữ lại tài liệu nghiên cứu về BẤT KỲ hoạt chất nào trong danh sách này, kể cả khi bài chỉ nói về MỘT chất; mỗi số liệu trích ra PHẢI ghi rõ nó thuộc hoạt chất nào)` : ''}. NẾU KHÔNG liên quan tới hoạt chất nào trong danh sách, LOẠI BỎ NGAY.
 - ĐỌC KỸ TOÀN BỘ "Nội dung chính" của TỪNG tài liệu (không chỉ đọc Abstract/Snippet) — dữ liệu thực nghiệm cụ thể (nồng độ, nhiệt độ, thời gian, % phân hủy) thường nằm sâu trong phần kết quả/bảng biểu của bài báo, không phải trong abstract. Đọc từng tài liệu ít nhất 2 lượt trước khi kết luận thiếu dữ liệu.
 - CHÚ Ý ĐẶC BIỆT các bảng kết quả dạng "Table X: Force/Forced Degradation Results" hoặc có cột "%Undegraded"/"% phân hủy"/"Degradation (%)". Vì nội dung PDF được chuyển sang văn bản thuần nên bảng thường bị mất căn chỉnh cột — các con số (VD: 80, 81.5, 9.2, 76, 91) có thể nằm rời rạc ngay sau hoặc gần dòng mô tả điều kiện tương ứng (VD: "Reflux for 2h with 0.5M HCl" rồi tới số "80" ngay sau — đó chính là % còn lại/chưa phân hủy của điều kiện acid). Hãy suy luận cẩn thận để khớp đúng số liệu với điều kiện tương ứng dựa trên thứ tự xuất hiện, KHÔNG bỏ qua các bảng chỉ vì bị mất định dạng.
 - Chỉ giữ lại các thông số thực nghiệm RÕ RÀNG: nồng độ chất thử (VD: HCl 1M), nhiệt độ (VD: 60°C), thời gian, và tên tạp chất/sản phẩm phân hủy thực tế.
@@ -1821,7 +1965,7 @@ BƯỚC 3: DỊCH SANG TIẾNG VIỆT
 Tài liệu nguồn thường bằng tiếng Anh — BẮT BUỘC dịch toàn bộ nội dung trích xuất (conditions, rate, products, mechanism, overview, conclusion...) sang tiếng Việt chuyên ngành dược trước khi điền vào JSON, KHÔNG để nguyên văn tiếng Anh (trừ trường "quote" — trích dẫn nguyên văn giữ nguyên ngôn ngữ gốc).`;
 
     const userMsg = papers.length
-      ? `Đọc kỹ TOÀN BỘ các tài liệu liên quan dưới đây (bao gồm cả phần "Nội dung chính" đầy đủ, không chỉ tóm tắt) về pH ổn định và phân hủy cưỡng bức của "${drugName}" (LƯU Ý: Chú ý ĐÀO THẢI những bài báo không tập trung vào ${drugName}):\n\n${paperContext}\n\nLập báo cáo. MỖI điều kiện cần ghi rõ Thông số thực nghiệm, Kết quả thu được và Nguồn trích dẫn. Trả về JSON:`
+      ? `Đọc kỹ TOÀN BỘ các tài liệu liên quan dưới đây (bao gồm cả phần "Nội dung chính" đầy đủ, không chỉ tóm tắt) về pH ổn định và phân hủy cưỡng bức của "${drugName}"${laPhoiHop ? ` — đây là CHẾ PHẨM PHỐI HỢP ${dsHoatChat.length} hoạt chất (${dsHoatChat.join(', ')}); giữ bài nói về BẤT KỲ hoạt chất nào trong danh sách, ghi rõ mỗi số liệu thuộc hoạt chất nào, và nếu phát hiện tương tác/xúc tác phân hủy CHÉO giữa các hoạt chất khi cùng tồn tại thì ghi vào "overview"` : ` (LƯU Ý: Chú ý ĐÀO THẢI những bài báo không tập trung vào ${drugName})`}:\n\n${paperContext}\n\nLập báo cáo. MỖI điều kiện cần ghi rõ Thông số thực nghiệm, Kết quả thu được và Nguồn trích dẫn${laPhoiHop ? ' (và hoạt chất mà số liệu đó thuộc về)' : ''}. Trả về JSON:`
       : `Dựa trên tài liệu (nếu có), hãy cung cấp dữ liệu thực nghiệm về độ ổn định của "${drugName}". Tuyệt đối không suy đoán lý thuyết. Trả về JSON:`;
 
     const template = `{
@@ -2019,6 +2163,17 @@ function normalizeDosageForm(form) {
   if (f.includes('nén') || f.includes('tablet') || f.includes('таблетки')) {
     return { vi: 'Viên nén', en: 'Tablet', ru: 'таблетки' };
   }
+  // Viên nang MỀM phải kiểm tra TRƯỚC viên nang (cứng) nói chung VÀ trước nhánh Gel bên dưới.
+  // "Softgel" (giá trị cũ của dropdown) chứa chữ "gel" nên nếu không chặn ở đây, nó sẽ rơi xuống
+  // nhánh "Thuốc mỡ/Kem/Gel" phía dưới — sai hoàn toàn dạng bào chế, kéo theo toàn bộ từ khóa tìm
+  // patent/stability bị gửi đi nhầm thành "Ointment/Cream/Gel". Thuật ngữ dược đúng là
+  // "soft capsule" / "soft gelatin capsule" — KHÔNG dùng "soft gel"/"softgel" (đó là tên thương
+  // mại của hãng R.P. Scherer, không phải thuật ngữ dược điển).
+  if (f.includes('nang mềm') || f.includes('nang mem') || f.includes('soft capsule')
+      || f.includes('softgel') || f.includes('soft gel') || f.includes('gelatin capsule')
+      || f.includes('мягкие капсулы')) {
+    return { vi: 'Viên nang mềm', en: 'Soft capsule / Soft gelatin capsule', ru: 'мягкие капсулы' };
+  }
   if (f.includes('nang') || f.includes('capsule') || f.includes('капсулы')) {
     return { vi: 'Viên nang', en: 'Capsule', ru: 'капсулы' };
   }
@@ -2038,6 +2193,11 @@ function normalizeDosageForm(form) {
   }
   if (f.includes('mỡ') || f.includes('kem') || f.includes('gel') || f.includes('cream') || f.includes('ointment') || f.includes('мазь')) {
     return { vi: 'Thuốc mỡ/Kem/Gel', en: 'Ointment/Cream/Gel', ru: 'мазь/крем/гель' };
+  }
+  // Cốm (Granules): trước đây rơi xuống nhánh "dạng khác" nên từ khoá tra dữ liệu Việt Nam là "granules"
+  // → không khớp dạng bào chế nào ("Thuốc cốm pha hỗn dịch", "Cốm kháng dịch dạ dày..."), báo 0 sản phẩm.
+  if (f.includes('cốm') || f.includes('granul') || f.includes('гранулы')) {
+    return { vi: 'Cốm', en: 'Granules', ru: 'гранулы' };
   }
   // Dạng khác không nằm trong danh sách trên: nếu chuỗi có phần tiếng Anh trong ngoặc "(...)" thì
   // dùng phần đó làm "en" (tránh query tìm kiếm bị lẫn tiếng Việt), phần trước ngoặc làm "vi".
@@ -2145,7 +2305,12 @@ JSON:
 }
 
 app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
-  const { drugName, dosageForm, searchId } = req.body;
+  const { dosageForm, searchId } = req.body;
+  // Công thức tham khảo tra theo CẢ TỔ HỢP: công thức của thuốc phối hợp là công thức của
+  // một sản phẩm, không phải ghép hai công thức đơn chất lại.
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  const drugName = ghepTenHoatChat(dsHoatChat) || req.body.drugName;
+  const laPhoiHop = dsHoatChat.length > 1;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
   if (!drugName || !dosageForm) return res.status(400).json({ error: 'Thiếu tên hoạt chất hoặc dạng bào chế' });
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
@@ -2220,11 +2385,15 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
       targetLinks = links; // Fallback dùng all links nếu lọc không ra
     }
 
-    // Sắp xếp đưa thuốc đơn chất (mono-preparation) lên trước
-    targetLinks.sort((a, b) => (b.isMono ? 1 : 0) - (a.isMono ? 1 : 0));
+    // Xếp loại công thức phù hợp lên trước. CHIỀU ƯU TIÊN PHỤ THUỘC THUỐC ĐANG TRA:
+    //  - đơn chất  → ưu tiên công thức ĐƠN CHẤT (mono) như trước nay,
+    //  - phối hợp  → ưu tiên công thức PHỐI HỢP, vì nếu vẫn đẩy đơn chất lên đầu thì mốc cắt
+    //    MAX_PRODUCTS bên dưới sẽ xén mất sạch công thức phối hợp — đúng thứ người dùng cần.
+    const uuTien = (x) => (laPhoiHop ? (x.isMono ? 0 : 1) : (x.isMono ? 1 : 0));
+    targetLinks.sort((a, b) => uuTien(b) - uuTien(a));
 
     // Giới hạn số sản phẩm xử lý để chạy NHANH & tránh request quá lâu bị cắt.
-    // Đã ưu tiên đơn chất lên đầu nên phần giữ lại là các sản phẩm phù hợp nhất.
+    // Đã ưu tiên loại công thức phù hợp lên đầu nên phần giữ lại là các sản phẩm phù hợp nhất.
     const MAX_PRODUCTS = 15;
     if (targetLinks.length > MAX_PRODUCTS) {
       console.log(`[Vidal] Giới hạn ${targetLinks.length} -> ${MAX_PRODUCTS} sản phẩm để tăng tốc.`);
@@ -2269,8 +2438,8 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     // Không còn giới hạn số sản phẩm -> chia nhỏ thành từng lô (batch) để gọi AI song song,
     // tránh 1 lệnh gọi duy nhất phải sinh ra JSON quá dài (dễ bị cắt cụt/lỗi parse khi có nhiều sản phẩm).
     updateProgress(searchId, 'vidal', 80, 'Đang gửi dữ liệu tiếng Nga tới OpenAI để dịch...');
-    // Ưu tiên công thức ĐƠN CHẤT: xếp lên trước công thức phối hợp (giữ đúng thứ tự khi chia lô AI).
-    productData.sort((a, b) => (b.isMono ? 1 : 0) - (a.isMono ? 1 : 0));
+    // Giữ đúng chiều ưu tiên như trên khi chia lô AI (phối hợp lên trước nếu đang tra thuốc phối hợp).
+    productData.sort((a, b) => uuTien(b) - uuTien(a));
     const BATCH_SIZE = 10;   // mỗi lô đẩy vào AI 10 sản phẩm (trước 8) — ít lượt gọi hơn, các lô vẫn dịch song song
     const productBatches = [];
     for (let i = 0; i < productData.length; i += BATCH_SIZE) {
@@ -2280,7 +2449,8 @@ app.post('/api/sra-formulas', requireApprovedUser, async (req, res) => {
     const aiSystem = `Bạn là chuyên gia bào chế và phiên dịch Dược phẩm Nga. Nhiệm vụ:
 1. Đọc các bản ghi thành phần từ Vidal.ru.
 2. LỌC: CHỈ giữ lại các sản phẩm khớp với dạng bào chế mục tiêu.
-   Dạng bào chế mục tiêu được định nghĩa là: Tiếng Việt: "${normalized.vi}", Tiếng Anh: "${normalized.en}", Tiếng Nga: "${normalized.ru}". Bỏ qua các sản phẩm không khớp.
+   Dạng bào chế mục tiêu được định nghĩa là: Tiếng Việt: "${normalized.vi}", Tiếng Anh: "${normalized.en}", Tiếng Nga: "${normalized.ru}". Bỏ qua các sản phẩm không khớp.${laPhoiHop ? `
+   LỌC THEO HOẠT CHẤT (BẮT BUỘC vì đây là CHẾ PHẨM PHỐI HỢP ${dsHoatChat.length} hoạt chất: ${dsHoatChat.join(', ')}): CHỈ giữ sản phẩm có ĐỦ TẤT CẢ ${dsHoatChat.length} hoạt chất này trong thành phần. Sản phẩm chỉ chứa MỘT phần trong số đó (thiếu dù chỉ 1 chất) → LOẠI BỎ, không đưa vào "products".` : ''}
 3. DỊCH TOÀN BỘ TÊN THÀNH PHẦN SANG TIẾNG VIỆT CHUYÊN NGÀNH DƯỢC (theo đúng Dược điển Việt Nam), VÀ PHÂN TÍCH VAI TRÒ TÁ DƯỢC:
    - QUY TRÌNH DỊCH BẮT BUỘC (2 bước SUY NGHĨ NỘI BỘ — nhưng trường "name" ở JSON đầu ra CHỈ ĐƯỢC chứa kết quả CUỐI CÙNG của Bước 2, TUYỆT ĐỐI KHÔNG được để tên tiếng Anh/quốc tế trong trường "name"):
      Bước 1 (nội bộ, không xuất ra): Từ tên tiếng Nga (thường là phiên âm/tương đương của tên quốc tế INN hoặc dược điển), NHẬN DIỆN tên quốc tế (INN/tiếng Anh/tiếng Latin) của hoạt chất/tá dược đó. Ví dụ: "лактозы моногидрат" → "Lactose monohydrate"; "повидон" → "Povidone (PVP)"; "магния стеарат" → "Magnesium stearate"; "тальк" → "Talc"; "кросповидон" → "Crospovidone".
@@ -2307,7 +2477,7 @@ Cấu trúc JSON:
       "country": "Nga",
       "dosageForm": "Dạng bào chế (tiếng Việt/Anh)",
       "strength": "Hàm lượng (nếu có)",
-      "activeIngredient": "Tên hoạt chất (Đã dịch sang tiếng Việt)",
+      "activeIngredient": "${laPhoiHop ? `Tên ĐỦ CẢ ${dsHoatChat.length} hoạt chất kèm hàm lượng từng chất, đã dịch tiếng Việt — ví dụ: 'Paracetamol 325 mg; Codein phosphat 30 mg'` : 'Tên hoạt chất (Đã dịch sang tiếng Việt)'}",
       "excipients": [
         {
           "name": "Tên tá dược sạch (không kèm hàm lượng, ví dụ: cellulose vi tinh thể)",
@@ -2330,7 +2500,7 @@ Cấu trúc JSON:
       try {
         const text = await callOpenAI(openaiKey, [
           { role: 'system', content: aiSystem },
-          { role: 'user', content: `Hoạt chất mục tiêu: ${drugName}\nDạng bào chế mục tiêu: ${dosageForm}\n\nDữ liệu tiếng Nga (${batch.length} sản phẩm):\n${promptData}\n\nHãy xuất JSON:` }
+          { role: 'user', content: `Hoạt chất mục tiêu: ${drugName}${laPhoiHop ? ` (PHẢI có ĐỦ cả ${dsHoatChat.length} hoạt chất: ${dsHoatChat.join(', ')})` : ''}\nDạng bào chế mục tiêu: ${dosageForm}\n\nDữ liệu tiếng Nga (${batch.length} sản phẩm):\n${promptData}\n\nHãy xuất JSON:` }
         ], 'deepseek/deepseek-chat', 3, 12000);
         return safeParseJSON(text);
       } catch (e) {
@@ -2525,7 +2695,12 @@ function scorePatentRelevance(doc, drugName, normalized) {
 }
 
 app.post('/api/patents', requireApprovedUser, async (req, res) => {
-  const { drugName, dosageForm, searchId } = req.body;
+  const { dosageForm, searchId } = req.body;
+  // Patent tra theo CẢ TỔ HỢP (patent của thuốc phối hợp là patent của sản phẩm, không phải của
+  // từng chất), nên `drugName` dùng cho truy vấn là chuỗi ghép; còn `dsHoatChat` dùng để chấm điểm
+  // liên quan theo từng chất ở bước lọc bên dưới.
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  const drugName = ghepTenHoatChat(dsHoatChat) || req.body.drugName;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
   const serperKey = req.body.serperKey || process.env.SERPER_API_KEY;
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu API key' });
@@ -2566,6 +2741,14 @@ app.post('/api/patents', requireApprovedUser, async (req, res) => {
       `${drugName} ${formKeyword} patent CN preparation method`.trim(),
       `${drugName} ${formKeyword} patent EP coating granule`.trim(),
       `${drugName} patent stability excipient tablet`.trim(),
+      // Thuốc phối hợp: thêm vài truy vấn nhắm ĐÚNG dạng kết hợp, vì patent của thuốc phối hợp
+      // thường ghi là "fixed dose combination" / "combination composition" chứ không chỉ liệt kê
+      // tên hai chất. Thuốc đơn chất không sinh thêm truy vấn nào (mảng rỗng) nên không tốn thêm
+      // hạn mức Serper và thời gian giữ nguyên như cũ.
+      ...(dsHoatChat.length > 1 ? [
+        `${drugName} fixed dose combination patent`.trim(),
+        `${drugName} ${formKeyword} combination pharmaceutical composition patent`.trim(),
+      ] : []),
     ];
     const settled = await Promise.allSettled([
       searchGooglePatentsDirect(`${drugName} ${formKeyword}`.trim(), 5),
@@ -2610,8 +2793,15 @@ app.post('/api/patents', requireApprovedUser, async (req, res) => {
     // LỌC LIÊN QUAN (rẻ, không cần đọc từng patent): kết quả tìm kiếm thô (nhất là Serper) lẫn rất nhiều
     // patent KHÔNG liên quan tới hoạt chất. Chỉ giữ patent có NHẮC TÊN hoạt chất trong tiêu đề/snippet,
     // và XẾP HẠNG: tên trong tiêu đề > trong snippet, có từ khóa dạng bào chế thì cộng thêm điểm.
-    const dn = (drugName || '').trim().toLowerCase();
-    const dnFirst = dn.split(/[\s\-]/)[0];
+    // Chấm theo TỪNG hoạt chất: thuốc phối hợp thì patent nhắc được chất nào cũng là có liên quan,
+    // còn patent nhắc ĐỦ cả tổ hợp mới chính là patent của sản phẩm phối hợp → thưởng đậm nhất.
+    // Với thuốc đơn chất (danh sách chỉ 1 tên) cách tính này ra ĐÚNG số điểm như trước khi sửa.
+    const dsHC = (dsHoatChat.length ? dsHoatChat : [drugName || ''])
+      .map((x) => String(x || '').trim().toLowerCase()).filter(Boolean);
+    // Token đầu của tên hoạt chất, dùng để khớp lỏng. Phải tách theo CẢ dấu "/" "+" ","  —
+    // bản cũ chỉ tách khoảng trắng và gạch nối nên "amlodipine/valsartan" giữ nguyên cả cụm,
+    // không tiêu đề patent nào chứa được cụm đó và tab Patent rỗng hoàn toàn.
+    const tokenDau = (s) => (s.split(/[\s\-/+,]+/).filter(Boolean)[0] || '');
     // Từ khóa dạng bào chế → tách thành các từ có nghĩa (>=4 ký tự). Patent chỉ được coi là "khớp dạng
     // bào chế" khi có ĐỦ tất cả các từ này (vd "effervescent tablet" cần cả "effervescent" và "tablet").
     const formTokens = (formKeyword || '').toLowerCase().split(/\s+/).filter((w) => w.length >= 4);
@@ -2619,27 +2809,40 @@ app.post('/api/patents', requireApprovedUser, async (req, res) => {
       const t = (r.title || '').toLowerCase();
       const s = (r.snippet || '').toLowerCase();
       const hay = t + ' ' + s;
-      const inTitle = dn && t.includes(dn);
-      const inSnippet = dn && s.includes(dn);
-      const inTitleLoose = dnFirst && dnFirst.length >= 4 && t.includes(dnFirst);
-      const hasDrug = inTitle || inSnippet || inTitleLoose;
+      let score = 0;
+      let soKhop = 0;
+      for (const hc of dsHC) {
+        const dau = tokenDau(hc);
+        const inTitle = t.includes(hc);
+        const inSnippet = s.includes(hc);
+        const inTitleLoose = dau.length >= 4 && t.includes(dau);
+        if (inTitle || inSnippet || inTitleLoose) soKhop++;
+        if (inTitle) score += 4; else if (inSnippet) score += 2; else if (inTitleLoose) score += 1;
+      }
+      const hasDrug = soKhop > 0;
+      // Nhắc đủ MỌI hoạt chất của tổ hợp = nhiều khả năng là patent của chính thuốc phối hợp.
+      const duHoatChat = dsHC.length > 1 && soKhop === dsHC.length;
+      if (duHoatChat) score += 5;
       const hasForm = formTokens.length > 0 && formTokens.every((tok) => hay.includes(tok));
       const matchesBoth = hasDrug && hasForm;
-      let score = 0;
-      if (inTitle) score += 4; else if (inSnippet) score += 2; else if (inTitleLoose) score += 1;
       if (hasForm) score += 3;
-      return { r, score, hasDrug, matchesBoth };
+      return { r, score, hasDrug, matchesBoth, duHoatChat };
     });
     // XẾP HẠNG: (1) patent khớp CẢ hoạt chất + dạng bào chế LÊN TRÊN CÙNG; (2) rồi tới patent khớp hoạt
     // chất; sắp theo điểm trong từng bậc. Nếu số patent có nhắc hoạt chất quá ít (<3) thì mới nối thêm
     // phần còn lại (không nhắc hoạt chất) xuống cuối để danh sách không bị trống.
     const related = scored.filter((x) => x.hasDrug)
-      .sort((a, b) => (Number(b.matchesBoth) - Number(a.matchesBoth)) || (b.score - a.score));
+      .sort((a, b) => (Number(b.duHoatChat) - Number(a.duHoatChat))
+                   || (Number(b.matchesBoth) - Number(a.matchesBoth))
+                   || (b.score - a.score));
     const rest = scored.filter((x) => !x.hasDrug);
     const ordered = related.length >= 3 ? related : [...related, ...rest];
-    const allPatents = ordered.map((x) => ({ title: x.r.title, url: x.r.link, pdfUrl: x.r.pdfUrl || null, snippet: x.r.snippet, matchBoth: !!x.matchesBoth }));
+    // `duHoatChat` phải đi theo ra tới client, nếu không giao diện không có cách nào gắn nhãn
+    // "khớp đủ tổ hợp" cho patent của chính thuốc phối hợp.
+    const allPatents = ordered.map((x) => ({ title: x.r.title, url: x.r.link, pdfUrl: x.r.pdfUrl || null, snippet: x.r.snippet, matchBoth: !!x.matchesBoth, duHoatChat: !!x.duHoatChat }));
     const bothCount = scored.filter((x) => x.matchesBoth).length;
-    console.log(`[patents] tổng=${unique.length} khớp-cả-2=${bothCount} liên-quan=${related.length} trả-về=${allPatents.length}`);
+    const comboCount = scored.filter((x) => x.duHoatChat).length;
+    console.log(`[patents] tổng=${unique.length} khớp-cả-2=${bothCount} đủ-tổ-hợp=${comboCount} liên-quan=${related.length} trả-về=${allPatents.length}`);
     updateProgress(searchId, 'patents', 100, 'Hoàn thành.');
     return res.json({
       patents: [],
@@ -2754,7 +2957,12 @@ async function getPharmacoeiaData() {
     const match = html.match(/const pharmacopoeiaData\s*=\s*(\[[\s\S]*?\]);\s*(?:\/\/|function|const|let|var|document|\n\s*\n)/);
     if (match) {
       const vm = require('vm');
-      _pharmacoData = vm.runInNewContext(match[1]);
+      // Dữ liệu nguồn chứa thực thể HTML (&#12296;171&#12297; = 〈171〉, &#8212; = —...) → giải mã để không hiện ký tự lạ
+      const giaiMa = (t) => String(t == null ? '' : t)
+        .replace(/&#x([0-9a-f]+);/gi, (m, h) => String.fromCodePoint(parseInt(h, 16)))
+        .replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(Number(d)))
+        .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'");
+      _pharmacoData = vm.runInNewContext(match[1]).map((e) => Object.assign({}, e, { title: giaiMa(e.title), description: giaiMa(e.description) }));
       _pharmacoFetchedAt = now;
       console.log(`[Pharmacopoeia] Loaded ${_pharmacoData.length} entries from Web.`);
       fs.writeFile(localPath, JSON.stringify(_pharmacoData, null, 2), 'utf8', () => {});
@@ -4179,10 +4387,10 @@ QUY TẮC NGHIÊM NGẶT:
 }
 
 // ── Route: Drug-Excipient Compatibility (PharmDE + dự phòng AI) ────────────────
-app.post('/api/compatibility', requireApprovedUser, async (req, res) => {
-  const { drugName, smiles, searchId } = req.body;
-  if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
-
+// Tra tương tác hoạt chất–tá dược cho ĐÚNG MỘT hoạt chất — giữ NGUYÊN toàn bộ logic PharmDE +
+// dịch thuật đã chạy ổn định. Route /api/compatibility bên dưới gọi hàm này cho TỪNG hoạt chất
+// (PharmDE vốn chỉ nhận 1 SMILES/lượt) rồi gộp kết quả theo hoạt chất.
+async function traTuongTacMotHoatChat(drugName, smiles, openaiKeyThamSo, searchId) {
   updateProgress(searchId, 'compatibility', 10, 'Bắt đầu kiểm tra tương tác hoạt chất - tá dược...');
 
   let targetSmiles = smiles;
@@ -4215,25 +4423,25 @@ app.post('/api/compatibility', requireApprovedUser, async (req, res) => {
   }
 
   // Hàm DỰ PHÒNG: khi PharmDE sập hoặc không lấy được SMILES, phân tích tương tác bằng DeepSeek :online.
-  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  const openaiKey = openaiKeyThamSo || process.env.OPENAI_API_KEY;
   const runAIFallback = async (reasonMsg) => {
     try {
       if (!openaiKey) throw new Error('Thiếu OpenAI API key');
       updateProgress(searchId, 'compatibility', 70, `${reasonMsg} — đang phân tích bằng AI (DeepSeek)...`);
       const ai = await analyzeCompatibilityAI(drugName, targetSmiles || '', openaiKey);
       updateProgress(searchId, 'compatibility', 100, `Hoàn thành (AI): ${ai.incompatibilities.length} tương tác.`);
-      return res.json({
+      return {
         smiles: targetSmiles || '',
         incompatibilities: ai.incompatibilities,
         total: ai.incompatibilities.length,
         overview: ai.overview,
         sources: ai.sources,
         dataSource: 'ai-analysis',
-      });
+      };
     } catch (aiErr) {
       console.error('[Compatibility AI fallback error]', aiErr.message);
       updateProgress(searchId, 'compatibility', 100, 'Lỗi phân tích tương tác.');
-      return res.status(500).json({ error: 'Không phân tích được tương tác tá dược (cả PharmDE lẫn AI đều không phản hồi): ' + aiErr.message });
+      return { error: 'Không phân tích được tương tác tá dược (cả PharmDE lẫn AI đều không phản hồi): ' + aiErr.message };
     }
   };
 
@@ -4396,71 +4604,303 @@ ${JSON.stringify(inputObj, null, 2)}`;
     }
 
     updateProgress(searchId, 'compatibility', 100, `Hoàn thành phân tích: tìm thấy ${incompatibilities.length} tương tác.`);
-    res.json({
+    return {
       smiles: targetSmiles,
       incompatibilities: finalIncompatibilities,
       total: incompatibilities.length,
       sourceUrl: url,
       dataSource: 'pharmde',
-    });
+    };
   } catch (err) {
     // Bất kỳ lỗi nào từ PharmDE (không phải timeout đã bắt ở trên) → chuyển sang phân tích bằng AI.
     console.error('[Compatibility error]', err.message);
     return runAIFallback('PharmDE gặp lỗi');
   }
+}
+
+app.post('/api/compatibility', requireApprovedUser, async (req, res) => {
+  // Tra RIÊNG từng hoạt chất: PharmDE vốn chỉ nhận 1 SMILES mỗi lượt nên không có cách "gộp"
+  // thật sự — mỗi hoạt chất một lượt tra, kết quả gộp lại và gắn nhãn hoạt chất cho từng mục.
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  if (!dsHoatChat.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  const { searchId } = req.body;
+  // smilesList (client gửi, lấy sẵn từ /api/properties) tránh tra PubChem lại lần nữa; nếu thiếu,
+  // traTuongTacMotHoatChat() tự tra SMILES theo tên như hành vi gốc.
+  const smilesList = Array.isArray(req.body.smilesList) ? req.body.smilesList : [];
+  const laySmiles = (ten, i) => {
+    const m = smilesList.find((x) => x && x.drugName === ten);
+    if (m) return m.smiles || '';
+    if (smilesList[i]) return smilesList[i].smiles || '';
+    return dsHoatChat.length === 1 ? (req.body.smiles || '') : '';
+  };
+
+  const ketQua = await Promise.all(dsHoatChat.map((ten, i) =>
+    traTuongTacMotHoatChat(ten, laySmiles(ten, i), openaiKey, i === 0 ? searchId : undefined)));
+
+  // Đơn hoạt chất: trả ĐÚNG hình dạng cũ ở cấp cao nhất — không phải sửa gì ở phía client cũ.
+  if (ketQua.length === 1) {
+    const r = ketQua[0];
+    if (r.error) return res.status(500).json({ error: r.error });
+    return res.json(r);
+  }
+
+  // Phối hợp: gộp danh sách tương tác, gắn forDrug, khử trùng lặp CÙNG hoạt chất + cùng tiêu đề
+  // + cùng loại tá dược (hai hoạt chất khác nhau tương tác cùng 1 tá dược là 2 phát hiện khác nhau).
+  const daThay = new Set();
+  const incompatibilities = [];
+  ketQua.forEach((r, i) => {
+    if (!r || r.error) return;
+    (r.incompatibilities || []).forEach((it) => {
+      const khoa = dsHoatChat[i] + '|' + (it.title || '') + '|' + (it.riskExcipientType || '');
+      if (daThay.has(khoa)) return;
+      daThay.add(khoa);
+      incompatibilities.push(Object.assign({ forDrug: dsHoatChat[i] }, it));
+    });
+  });
+  const soLoi = ketQua.filter((r) => r && r.error).length;
+  res.json({
+    perDrug: ketQua.map((r, i) => ({
+      drugName: dsHoatChat[i], smiles: (r && r.smiles) || '',
+      total: (r && r.incompatibilities || []).length, dataSource: r && r.dataSource, error: (r && r.error) || null,
+    })),
+    incompatibilities,
+    total: incompatibilities.length,
+    dataSource: ketQua.some((r) => r && r.dataSource === 'pharmde') ? 'pharmde' : 'ai-analysis',
+    partialError: soLoi > 0 && soLoi < ketQua.length
+      ? `${soLoi}/${ketQua.length} hoạt chất không tra được` : null,
+  });
+});
+
+// Các tên hoạt chất CÙNG MỘT CHẤT nhưng khác nhau giữa danh pháp Mỹ/Anh (USP hay dùng INN Mỹ,
+// vd "Acetaminophen" thay vì "Paracetamol") hoặc khác chính tả Anh/Việt. Mỗi nhóm con là các từ
+// ĐỒNG NGHĨA — khớp bất kỳ từ nào trong nhóm là đủ.
+const PHARMACOPOEIA_ALIASES = [
+  ['paracetamol', 'acetaminophen'],
+  ['codeine', 'codein'],
+  ['hydrochlorothiazide', 'hydrochlorthiazide'],
+  ['salbutamol', 'albuterol'],
+  ['adrenaline', 'epinephrine'],
+  ['noradrenaline', 'norepinephrine'],
+  ['lidocaine', 'lignocaine'],
+  ['rifampicin', 'rifampin'],
+  ['frusemide', 'furosemide'],
+  ['amphetamine', 'amfetamine'],
+  ['diazepam', 'diazepam'],
+];
+
+// Trả về mọi từ khoá (chữ thường) dùng để tìm MỘT hoạt chất trong title monograph: chính tên đó,
+// cộng tên đồng nghĩa nếu nằm trong bảng trên, cộng từ ĐẦU TIÊN của tên (phòng khi người dùng gõ
+// kèm hậu tố muối/dạng bào chế — vd "Codein phosphat" vẫn khớp được monograph ghi "Codeine Phosphate").
+// Vitamin gọi theo ký hiệu ↔ tên hoạt chất trong dược điển (Vitamin B6 = pyridoxine...)
+const VITAMIN_TEN = [
+  [/^(vitamin|vit\.?)\s*b\s*6$|^b6$/, ['pyridoxine', 'pyridoxin']],
+  [/^(vitamin|vit\.?)\s*b\s*1$|^b1$/, ['thiamine', 'thiamin']],
+  [/^(vitamin|vit\.?)\s*b\s*2$|^b2$/, ['riboflavin']],
+  [/^(vitamin|vit\.?)\s*b\s*12$|^b12$/, ['cyanocobalamin', 'cobalamin']],
+  [/^(vitamin|vit\.?)\s*(pp|b\s*3)$|^pp$/, ['nicotinamide', 'niacinamide', 'nicotinic acid']],
+  [/^(vitamin|vit\.?)\s*b\s*5$|^b5$/, ['dexpanthenol', 'pantothenate', 'pantothenic']],
+  [/^(vitamin|vit\.?)\s*b\s*9$|^b9$/, ['folic acid']],
+  [/^(vitamin|vit\.?)\s*c$/, ['ascorbic acid']],
+  [/^(vitamin|vit\.?)\s*d\s*3$/, ['cholecalciferol']], [/^(vitamin|vit\.?)\s*d\s*2$/, ['ergocalciferol']],
+  [/^(vitamin|vit\.?)\s*e$/, ['tocopherol', 'tocopheryl']], [/^(vitamin|vit\.?)\s*k\s*1?$/, ['phytomenadione', 'phytonadione']],
+];
+// Từ chung chung (vitamin, acid, natri...) KHÔNG được dùng một mình làm từ khoá — nếu không "Vitamin B6" sẽ khớp mọi chuyên luận vitamin
+const TU_CHUNG_DUOC_DIEN = new Set(['vitamin', 'acid', 'natri', 'kali', 'calci', 'magnesi', 'sodium', 'potassium', 'calcium', 'magnesium', 'zinc', 'iron', 'sat', 'kem', 'l', 'dl']);
+function tuKhoaChoHoatChat(ten) {
+  const q = String(ten || '').trim().toLowerCase();
+  if (!q) return [];
+  const ds = new Set([q]);
+  for (const nhom of PHARMACOPOEIA_ALIASES) if (nhom.includes(q)) nhom.forEach((x) => ds.add(x));
+  for (const [re, tens] of VITAMIN_TEN) if (re.test(q)) tens.forEach((x) => ds.add(x));
+  const tuDau = q.split(/\s+/)[0];
+  if (tuDau && tuDau.length >= 4 && !TU_CHUNG_DUOC_DIEN.has(tuDau)) ds.add(tuDau);
+  return [...ds];
+}
+
+// Dò dạng bào chế từ title monograph — giữ NGUYÊN logic gốc, tách thành hàm để dùng lại cho
+// nhiều hoạt chất mà không chép lại 20 dòng if/else.
+function nhomTheoDangBaoChe(results) {
+  const grouped = {};
+  for (const entry of results) {
+    const title = entry.title || '';
+    let form = 'General/Bulk';
+    const tl = title.toLowerCase();
+    if (tl.includes('extended-release tablet') || tl.includes('prolonged-release tablet') || tl.includes('modified-release tablet')) form = 'Extended-Release Tablet';
+    else if (tl.includes('effervescent tablet') || tl.includes('effervescent oral')) form = 'Effervescent Tablet';
+    else if (tl.includes('chewable tablet')) form = 'Chewable Tablet';
+    else if (tl.includes('dispersible tablet')) form = 'Dispersible Tablet';
+    else if (tl.includes('tablet')) form = 'Tablet';
+    else if (tl.includes('extended-release capsule') || tl.includes('prolonged-release capsule')) form = 'Extended-Release Capsule';
+    else if (tl.includes('capsule')) form = 'Capsule';
+    else if (tl.includes('oral solution') || tl.includes('oral liquid')) form = 'Oral Solution';
+    else if (tl.includes('oral suspension') || tl.includes('suspension')) form = 'Suspension';
+    else if (tl.includes('oral drops') || tl.includes('drops')) form = 'Oral Drops';
+    else if (tl.includes('syrup')) form = 'Syrup';
+    else if (tl.includes('granule') || tl.includes('granules')) form = 'Granules';
+    else if (tl.includes('powder')) form = 'Powder';
+    else if (tl.includes('injection') || tl.includes('infusion') || tl.includes('parenteral')) form = 'Injection/Infusion';
+    else if (tl.includes('suppositorie') || tl.includes('suppository')) form = 'Suppository';
+    else if (tl.includes('cream') || tl.includes('ointment') || tl.includes('gel')) form = 'Topical';
+    else if (tl.includes('eye drop') || tl.includes('ophthalmic')) form = 'Ophthalmic';
+    else if (tl.includes('patch') || tl.includes('transdermal')) form = 'Transdermal';
+    if (!grouped[form]) grouped[form] = [];
+    grouped[form].push({ id: entry.id, title, book: entry.book, description: entry.description, pdfUrl: entry.pdfUrl });
+  }
+  return grouped;
+}
+
+// ── Route: Tương kỵ GIỮA CÁC HOẠT CHẤT (thuốc phối hợp) ────────────────────────
+// Khác hẳn /api/compatibility (hoạt chất ↔ tá dược): đây là tương kỵ LÝ–HÓA giữa CHÍNH các hoạt
+// chất với nhau trong cùng một công thức — rủi ro bào chế lớn nhất của thuốc phối hợp, và trước
+// nay KHÔNG có chỗ nào tra. Chỉ có ý nghĩa khi ≥2 hoạt chất.
+app.post('/api/api-interaction', requireApprovedUser, async (req, res) => {
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+  const { searchId } = req.body;
+  if (dsHoatChat.length < 2) return res.status(400).json({ error: 'Cần ít nhất 2 hoạt chất để phân tích tương kỵ' });
+  if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
+
+  // SMILES client gửi kèm (lấy sẵn từ /api/properties, không tra mạng lại) — chỉ dùng để NHÚNG
+  // vào prompt cho AI tham khảo cấu trúc, không bắt buộc phải có đủ.
+  const smilesMap = new Map();
+  if (Array.isArray(req.body.smilesList)) {
+    for (const m of req.body.smilesList) if (m && m.drugName) smilesMap.set(m.drugName, m.smiles || '');
+  }
+
+  updateProgress(searchId, 'apimix', 10, 'Đang phân tích tương kỵ giữa các hoạt chất...');
+
+  // Mọi cặp hoạt chất, tối đa 3 cặp (ngân sách Serper/AI) — đủ cho thuốc phối hợp 2-3 hoạt chất
+  // (C(2,2)=1, C(3,2)=3); với 4-5 hoạt chất chỉ lấy 3 cặp đầu, không để chi phí tăng theo C(N,2).
+  const capNhat = [];
+  for (let i = 0; i < dsHoatChat.length; i++) {
+    for (let j = i + 1; j < dsHoatChat.length; j++) capNhat.push([dsHoatChat[i], dsHoatChat[j]]);
+  }
+  const cacCap = capNhat.slice(0, 3);
+
+  try {
+    const moTaCap = cacCap.map(([a, b], i) => {
+      const sa = smilesMap.get(a), sb = smilesMap.get(b);
+      return `${i + 1}. ${a}${sa ? ` (SMILES: ${sa})` : ''}  ↔  ${b}${sb ? ` (SMILES: ${sb})` : ''}`;
+    }).join('\n');
+
+    const system = `Bạn là chuyên gia hóa dược & bào chế, có khả năng tìm kiếm web thời gian thực. Nhiệm vụ: đánh giá khả năng TƯƠNG KỴ LÝ–HÓA (không phải tương tác dược động/dược lực trên cơ thể) giữa CÁC CẶP hoạt chất được liệt kê, khi chúng cùng tồn tại trong MỘT công thức phối hợp.
+QUY TẮC NGHIÊM NGẶT — CHỐNG BỊA:
+1. PHÂN BIỆT TUYỆT ĐỐI hai loại tương tác: (a) tương kỵ LÝ–HÓA trong công thức (phản ứng hóa học, hấp phụ, eutectic, đổi màu, sinh tạp...) — đây là mục tiêu CHÍNH, điền vào "findings"; (b) tương tác DƯỢC ĐỘNG/DƯỢC LỰC trên cơ thể người dùng (cạnh tranh chuyển hóa, hiệp lực/đối kháng tác dụng...) — KHÔNG điền vào "findings", chỉ ghi ngắn gọn vào "pkPdNote".
+2. Với MỖI phát hiện tương kỵ lý–hóa: nêu loại phản ứng, cơ chế, điều kiện xúc tác (độ ẩm/nhiệt/pH/ánh sáng/tiếp xúc trực tiếp), hệ quả bào chế (giảm hàm lượng, sinh tạp chất, đổi màu, chảy lỏng do hỗn hợp eutectic...).
+3. BẮT BUỘC gắn "evidenceLevel" TRUNG THỰC cho MỖI finding: "thuc-nghiem-cong-bo" (có bài báo/tài liệu CỤ THỂ, PHẢI kèm "sourceUrl" là URL THẬT đã đọc) hoặc "suy-luan-tu-nhom-chuc" (chỉ suy từ nhóm chức hóa học, KHÔNG có tài liệu thực nghiệm cụ thể — "sourceUrl" để null). TUYỆT ĐỐI KHÔNG gắn "thuc-nghiem-cong-bo" nếu không có URL thật kèm theo — đây là lỗi nghiêm trọng nhất.
+4. Nếu cặp hoạt chất ĐÃ CÓ thuốc phối hợp được FDA/EMA/cơ quan quản lý phê duyệt lưu hành — đây là bằng chứng mạnh nhất rằng phối hợp được về mặt bào chế — nêu rõ trong "approvedCombination" kèm URL nhãn thuốc thật.
+5. KHÔNG tìm thấy tài liệu nào về một cặp → "verdict": "no-data", "findings": []. TUYỆT ĐỐI KHÔNG được suy ra "không có tương kỵ" chỉ vì thiếu tài liệu — "chưa tìm thấy dữ liệu công bố" và "đã xác nhận không tương kỵ" là HAI điều khác nhau, không được lẫn lộn.
+6. Toàn bộ bằng tiếng Việt chuyên ngành dược. Đầu ra CUỐI CÙNG là JSON hợp lệ, KHÔNG markdown, KHÔNG text ngoài JSON.`;
+
+    const user = `Phân tích tương kỵ lý–hóa cho các cặp hoạt chất sau (đọc tài liệu thật rồi trả lời, không suy đoán):
+${moTaCap}
+
+Trả về JSON:
+{
+  "overview": "Nhận định tổng quan về khả năng phối hợp các hoạt chất này trong cùng một công thức.",
+  "approvedCombination": { "exists": false, "examples": [{"brand": "Tên biệt dược", "regulator": "FDA | EMA | DAV", "url": "URL nhãn thuốc thật"}] },
+  "pairs": [
+    {
+      "drugA": "...", "drugB": "...",
+      "verdict": "incompatible | caution | compatible | no-data",
+      "findings": [
+        {
+          "title": "Tên tương kỵ", "reactionType": "Loại phản ứng/hiện tượng vật lý",
+          "mechanism": "Cơ chế chi tiết", "triggerConditions": "Điều kiện làm tương kỵ xảy ra",
+          "consequence": "Hệ quả bào chế",
+          "evidenceLevel": "thuc-nghiem-cong-bo | suy-luan-tu-nhom-chuc",
+          "sourceUrl": "URL thật hoặc null"
+        }
+      ],
+      "formulationAdvice": "Khuyến nghị bào chế: tạo hạt riêng / bao cách ly / viên 2 lớp / chọn tá dược đệm...",
+      "pkPdNote": "Tương tác dược động/dược lực trên cơ thể (nếu có) — KHÁC với tương kỵ lý-hóa ở trên"
+    }
+  ],
+  "sources": [{"url": "...", "title": "..."}]
+}`;
+
+    const text = await callOpenAI(openaiKey, [
+      { role: 'system', content: system },
+      { role: 'user', content: user },
+    ], 'deepseek/deepseek-chat:online', 3, 16000);
+
+    updateProgress(searchId, 'apimix', 90, 'Đang xử lý kết quả...');
+    const parsed = safeParseJSON(text);
+    updateProgress(searchId, 'apimix', 100, 'Hoàn thành.');
+    res.json({
+      overview: parsed.overview || '',
+      approvedCombination: parsed.approvedCombination || { exists: false, examples: [] },
+      pairs: Array.isArray(parsed.pairs) ? parsed.pairs : [],
+      sources: Array.isArray(parsed.sources) ? parsed.sources : [],
+      totalPairsAnalyzed: cacCap.length,
+      totalPairsPossible: capNhat.length,
+    });
+  } catch (err) {
+    console.error('[api-interaction error]', err.message);
+    updateProgress(searchId, 'apimix', 100, 'Lỗi phân tích.');
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post('/api/pharmacopoeia/search', requireApprovedUser, async (req, res) => {
-  const { drugName, searchId } = req.body;
-  if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  if (!dsHoatChat.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
 
-  updateProgress(searchId, 'pharma', 20, 'Đang tải dữ liệu dược điển...');
+  updateProgress(req.body.searchId, 'pharma', 20, 'Đang tải dữ liệu dược điển...');
   try {
+    const { searchId } = req.body;
     const allData = await getPharmacoeiaData();
     updateProgress(searchId, 'pharma', 60, 'Đang phân tích các monograph...');
-    const q = drugName.trim().toLowerCase();
-    // Tạo các từ khoá tìm kiếm: tên gốc + tên thay thế phổ biến
-    const aliases = [q];
-    if (q === 'paracetamol' || q === 'acetaminophen') { aliases.push('paracetamol', 'acetaminophen'); }
 
-    const results = allData.filter(entry => {
-      const t = (entry.title || '').toLowerCase();
-      return aliases.some(a => t.includes(a));
-    });
+    // Từ khoá của từng hoạt chất, tính 1 lần dùng lại cho cả bước riêng lẫn bước tổ hợp.
+    const tuKhoaTheoChat = dsHoatChat.map((ten) => tuKhoaChoHoatChat(ten));
 
-    // Nhóm theo dạng bào chế (trích từ title)
-    const grouped = {};
-    for (const entry of results) {
-      const title = entry.title || '';
-      // Phát hiện dạng bào chế từ title
-      let form = 'General/Bulk';
-      const tl = title.toLowerCase();
-      if (tl.includes('extended-release tablet') || tl.includes('prolonged-release tablet') || tl.includes('modified-release tablet')) form = 'Extended-Release Tablet';
-      else if (tl.includes('effervescent tablet') || tl.includes('effervescent oral')) form = 'Effervescent Tablet';
-      else if (tl.includes('chewable tablet')) form = 'Chewable Tablet';
-      else if (tl.includes('dispersible tablet')) form = 'Dispersible Tablet';
-      else if (tl.includes('tablet')) form = 'Tablet';
-      else if (tl.includes('extended-release capsule') || tl.includes('prolonged-release capsule')) form = 'Extended-Release Capsule';
-      else if (tl.includes('capsule')) form = 'Capsule';
-      else if (tl.includes('oral solution') || tl.includes('oral liquid')) form = 'Oral Solution';
-      else if (tl.includes('oral suspension') || tl.includes('suspension')) form = 'Suspension';
-      else if (tl.includes('oral drops') || tl.includes('drops')) form = 'Oral Drops';
-      else if (tl.includes('syrup')) form = 'Syrup';
-      else if (tl.includes('granule') || tl.includes('granules')) form = 'Granules';
-      else if (tl.includes('powder')) form = 'Powder';
-      else if (tl.includes('injection') || tl.includes('infusion') || tl.includes('parenteral')) form = 'Injection/Infusion';
-      else if (tl.includes('suppositorie') || tl.includes('suppository')) form = 'Suppository';
-      else if (tl.includes('cream') || tl.includes('ointment') || tl.includes('gel')) form = 'Topical';
-      else if (tl.includes('eye drop') || tl.includes('ophthalmic')) form = 'Ophthalmic';
-      else if (tl.includes('patch') || tl.includes('transdermal')) form = 'Transdermal';
-      if (!grouped[form]) grouped[form] = [];
-      grouped[form].push({ id: entry.id, title, book: entry.book, description: entry.description, pdfUrl: entry.pdfUrl });
+    // ĐƠN HOẠT CHẤT: giữ NGUYÊN hình dạng phản hồi cũ { total, grouped } — không có trường mới
+    // nào để không phải sửa gì ở phía đọc dữ liệu cũ.
+    if (dsHoatChat.length === 1) {
+      const aliases = tuKhoaTheoChat[0];
+      const results = allData.filter((entry) => {
+        const t = (entry.title || '').toLowerCase();
+        return aliases.some((a) => t.includes(a));
+      });
+      updateProgress(searchId, 'pharma', 100, 'Hoàn thành.');
+      return res.json({ total: results.length, grouped: nhomTheoDangBaoChe(results) });
     }
 
+    // PHỐI HỢP: tra RIÊNG từng hoạt chất (nhóm "byDrug"), CỘNG THÊM nhóm "combination" — monograph
+    // mà title chứa ĐỦ TẤT CẢ hoạt chất (vd USP "Amlodipine and Valsartan Tablets"). Cùng nguyên lý
+    // "AND của OR" như applyDrugKeywordFilter (server.js) — chỉ khác tầng thực thi là lọc tại chỗ
+    // trên mảng JSON thay vì gửi xuống PostgREST.
+    const ketQuaTheoChat = tuKhoaTheoChat.map((aliases) => allData.filter((entry) => {
+      const t = (entry.title || '').toLowerCase();
+      return aliases.some((a) => t.includes(a));
+    }));
+    const byDrug = dsHoatChat.map((ten, i) => ({
+      drugName: ten, total: ketQuaTheoChat[i].length, grouped: nhomTheoDangBaoChe(ketQuaTheoChat[i]),
+    }));
+
+    const comboResults = allData.filter((entry) => {
+      const t = (entry.title || '').toLowerCase();
+      return tuKhoaTheoChat.every((aliases) => aliases.some((a) => t.includes(a)));
+    });
+    const combination = { total: comboResults.length, grouped: nhomTheoDangBaoChe(comboResults) };
+
+    // Gộp top-level total/grouped (hợp của mọi nhóm, khử trùng theo id) để client cũ chưa kịp cập
+    // nhật vẫn hiển thị được danh sách đầy đủ thay vì trống trơn.
+    const theoId = new Map();
+    for (const entry of [...comboResults, ...ketQuaTheoChat.flat()]) theoId.set(entry.id, entry);
+    const hopNhat = [...theoId.values()];
+
     updateProgress(searchId, 'pharma', 100, 'Hoàn thành.');
-    res.json({ total: results.length, grouped });
+    res.json({
+      total: hopNhat.length,
+      grouped: nhomTheoDangBaoChe(hopNhat),
+      byDrug,
+      combination,
+    });
   } catch (err) {
-    updateProgress(searchId, 'pharma', 100, 'Lỗi tiến trình.');
+    updateProgress(req.body.searchId, 'pharma', 100, 'Lỗi tiến trình.');
     console.error('[Pharmacopoeia search error]', err.message);
     res.status(500).json({ error: err.message });
   }
@@ -4584,11 +5024,12 @@ YÊU CẦU NGHIÊM NGẶT:
 - Giữ CHÍNH XÁC mọi con số theo dược điển. TUYỆT ĐỐI KHÔNG bịa — nếu tra không ra số liệu cụ thể thì nêu rõ đang theo chương chung nào và mô tả nguyên tắc, KHÔNG tự chế số.
 - KHÔNG để lẫn tiếng Anh — dịch hết sang tiếng Việt (giữ nguyên tên hóa chất quốc tế + số hiệu chương như <6.10>).
 - CHỈ trả về VĂN BẢN THUẦN (không JSON, không markdown, không dùng dấu ** hay #). Chỉ trả "KHÔNG CÓ" nếu chỉ tiêu này HOÀN TOÀN không có phép thử nào áp dụng.
+- TUYỆT ĐỐI KHÔNG dùng LaTeX (không \[ \], \( \), \frac, \text, \times, $...$). Viết công thức bằng chữ thường, ví dụ: Hòa tan (%) = (A mẫu / A chuẩn) × (C chuẩn / C mẫu) × 100.
 
 NỘI DUNG CHUYÊN LUẬN:
 ${monographText || '(Không trích xuất được PDF — hãy TỰ TRA CỨU chuyên luận & chương chung của dược điển này qua web, tuyệt đối không bịa số liệu.)'}`
         }], 'deepseek/deepseek-chat:online', 3, 8000);
-        const phuongPhap = (mText || '').trim().replace(/\*\*/g, '').replace(/^#+\s*/gm, '');
+        const phuongPhap = latexToPlain((mText || '').trim().replace(/\*\*/g, '').replace(/^#+\s*/gm, ''));
         doneCount++;
         updateProgress(searchId, 'pharmaStandards', 40 + Math.round((doneCount / Math.max(criteria.length, 1)) * 58),
           `Đang tra cứu phương pháp tiến hành (${doneCount}/${criteria.length} chỉ tiêu)...`);
@@ -4602,7 +5043,7 @@ ${monographText || '(Không trích xuất được PDF — hãy TỰ TRA CỨU c
     parsed.testMethods = methodResults.filter(Boolean);
 
     updateProgress(searchId, 'pharmaStandards', 100, 'Hoàn thành.');
-    res.json(parsed);
+    res.json(sanDeep(parsed));
   } catch (err) {
     console.error('[Pharmacopoeia standards error]', err.message);
     res.status(500).json({ error: err.message });
@@ -4620,6 +5061,7 @@ const DC_SECTION_LABEL = {
   stability: 'Độ ổn định / phân hủy cưỡng bức', sra: 'Công thức tham khảo & quy trình bào chế',
   patents: 'Patent thuốc gốc', pharma: 'Tiêu chuẩn chất lượng theo dược điển',
   compat: 'Tương tác hoạt chất – tá dược',
+  apimix: 'Tương kỵ giữa các hoạt chất',
 };
 app.post('/api/double-check', requireApprovedUser, async (req, res) => {
   const { section, drugName, dosageForm, claimsText } = req.body;
@@ -4854,9 +5296,15 @@ app.post('/api/protocol/export', requireApprovedUser, async (req, res) => {
 });
 
 app.post('/api/clinical-info', requireApprovedUser, async (req, res) => {
-  const { drugName, dosageForm, searchId } = req.body;
+  const { dosageForm, searchId } = req.body;
+  // Thông tin dược lý tra theo CẢ TỔ HỢP: chỉ định/liều dùng là của CHÍNH sản phẩm phối hợp,
+  // nhưng dược động học (PK) và dược lực học vẫn là đặc tính RIÊNG của từng hoạt chất — SmPC thật
+  // của thuốc phối hợp cũng trình bày mục 5.2 theo đúng cách này.
+  const dsHoatChat = layDanhSachHoatChat(req.body);
+  const drugName = ghepTenHoatChat(dsHoatChat) || req.body.drugName;
+  const laPhoiHop = dsHoatChat.length > 1;
   const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
-  if (!drugName) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+  if (!dsHoatChat.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
   if (!openaiKey) return res.status(400).json({ error: 'Thiếu OpenAI API key' });
 
   updateProgress(searchId, 'clinical', 10, 'Khởi động tra cứu thông tin dược lý & bào chế...');
@@ -4869,14 +5317,14 @@ app.post('/api/clinical-info', requireApprovedUser, async (req, res) => {
         role: 'system',
         content: `Bạn là chuyên gia dược lâm sàng, tìm kiếm web thời gian thực. Nhiệm vụ: đọc KỸ tài liệu kê toa THẬT của thuốc và trích ĐẦY ĐỦ thông tin, KHÔNG bỏ sót, KHÔNG bịa.
 - Nguồn ưu tiên: tờ SmPC (medicines.org.uk/EMA), nhãn FDA (dailymed/accessdata.fda.gov), DrugBank, MIMS, Dược thư Quốc gia Việt Nam.
-- PHẢI đọc đủ các mục sau và trích chi tiết từng mục: (4.1) Chỉ định; (4.2) Liều dùng & cách dùng (mọi đối tượng, hiệu chỉnh liều, cách dùng, xử trí quên liều, liều tối đa); (5.1) Dược lực học (nhóm dược lý + mã ATC + cơ chế tác dụng); (5.2) Dược động học — BẮT BUỘC đọc HẾT và nêu riêng đủ 4 phần Hấp thu / Phân bố / Chuyển hóa / Thải trừ (với số liệu F, Tmax, Cmax, AUC, Vd, %gắn protein, enzym CYP, chất chuyển hóa, t1/2, độ thanh thải, %thải...); (6.1) Danh sách tá dược của chế phẩm; và ĐẶC ĐIỂM GIẢI PHÓNG THUỐC của dạng bào chế "${normalized.en}" (giải phóng ngay/kéo dài/bao tan trong ruột — KHÔNG phải mô tả cảm quan/hình dạng viên).
+- PHẢI đọc đủ các mục sau và trích chi tiết từng mục: (4.1) Chỉ định; (4.2) Liều dùng & cách dùng (mọi đối tượng, hiệu chỉnh liều, cách dùng, xử trí quên liều, liều tối đa); (5.1) Dược lực học (nhóm dược lý + mã ATC + cơ chế tác dụng); (5.2) Dược động học — BẮT BUỘC đọc HẾT và nêu riêng đủ 4 phần Hấp thu / Phân bố / Chuyển hóa / Thải trừ (với số liệu F, Tmax, Cmax, AUC, Vd, %gắn protein, enzym CYP, chất chuyển hóa, t1/2, độ thanh thải, %thải...); (6.1) Danh sách tá dược của chế phẩm; và ĐẶC ĐIỂM GIẢI PHÓNG THUỐC của dạng bào chế "${normalized.en}" (giải phóng ngay/kéo dài/bao tan trong ruột — KHÔNG phải mô tả cảm quan/hình dạng viên).${laPhoiHop ? ` ĐÂY LÀ CHẾ PHẨM PHỐI HỢP gồm ${dsHoatChat.length} hoạt chất: ${dsHoatChat.join(', ')}. Ưu tiên đọc SmPC/nhãn của CHÍNH SẢN PHẨM PHỐI HỢP này nếu có; mục (5.1) và (5.2) của thuốc phối hợp luôn trình bày RIÊNG cho TỪNG hoạt chất — phải đọc và trích đủ cho TẤT CẢ ${dsHoatChat.length} hoạt chất, không được chỉ lấy 1 chất rồi suy ra cho chất còn lại. Nếu không tìm được SmPC của chế phẩm phối hợp, đọc SmPC riêng của từng hoạt chất và NÊU RÕ trong phần NGUỒN là đã làm vậy.` : ''}
 - Nếu một mục thực sự không có trong tài liệu, ghi "KHÔNG CÓ DỮ LIỆU". Nhưng phải cố gắng đọc thêm nhiều nguồn trước khi kết luận thiếu.
 - Cuối cùng liệt kê mục "NGUỒN:" gồm các URL thật + tiêu đề đã đọc.
 Trình bày dạng văn bản có tiêu đề rõ từng mục. Có thể để nguyên tiếng Anh ở bước này (sẽ dịch ở bước sau).`,
       },
       {
         role: 'user',
-        content: `Nghiên cứu ĐẦY ĐỦ thuốc "${drugName}" (dạng bào chế: ${normalized.vi} / ${normalized.en}). Đọc kỹ SmPC/nhãn/DrugBank, đặc biệt đọc HẾT mục Dược động học (5.2) để lấy đủ cả 4 phần Hấp thu/Phân bố/Chuyển hóa/Thải trừ, và mục Tá dược (6.1). Trích chi tiết, không tóm tắt, kèm danh sách NGUỒN (URL).`,
+        content: `Nghiên cứu ĐẦY ĐỦ thuốc "${drugName}" (dạng bào chế: ${normalized.vi} / ${normalized.en}).${laPhoiHop ? ` Đây là chế phẩm phối hợp ${dsHoatChat.length} hoạt chất — PK và dược lực học phải có đủ cho TỪNG hoạt chất: ${dsHoatChat.join(', ')}.` : ''} Đọc kỹ SmPC/nhãn/DrugBank, đặc biệt đọc HẾT mục Dược động học (5.2) để lấy đủ cả 4 phần Hấp thu/Phân bố/Chuyển hóa/Thải trừ${laPhoiHop ? ' CHO TỪNG HOẠT CHẤT' : ''}, và mục Tá dược (6.1). Trích chi tiết, không tóm tắt, kèm danh sách NGUỒN (URL).`,
       },
     ], 'deepseek/deepseek-chat:online', 3, 8000);
 
@@ -4891,7 +5339,7 @@ QUY TẮC:
 2. GIỮ ĐẦY ĐỦ chi tiết & số liệu — KHÔNG tóm tắt, KHÔNG lược bớt.
 3. TUYỆT ĐỐI KHÔNG bịa thêm: chỉ dùng thông tin có trong tài liệu cho sẵn. Mục nào tài liệu ghi "KHÔNG CÓ DỮ LIỆU" thì để "Không tìm thấy dữ liệu công bố".
 4. "drugRelease" chỉ nói về đặc điểm/cơ chế GIẢI PHÓNG (giải phóng ngay/kéo dài/bao tan trong ruột...), KHÔNG phải mô tả hình dạng/màu sắc viên.
-5. Các trường văn bản (indications, dosageAdministration, pharmacodynamics, drugRelease, và 4 trường con pharmacokinetics) PHẢI là CHUỖI (string), xuống dòng bằng "\\n".
+5. Các trường văn bản (indications, dosageAdministration, pharmacodynamics, drugRelease) PHẢI là CHUỖI (string), xuống dòng bằng "\\n". Trong "pharmacokinetics": nếu là đơn hoạt chất thì 4 trường con (absorption/distribution/metabolism/elimination) PHẢI là chuỗi; nếu là chế phẩm phối hợp thì "pharmacokinetics" là MẢNG, mỗi phần tử {drugName, absorption, distribution, metabolism, elimination} với 4 trường con vẫn là chuỗi.
 6. "sources" lấy từ mục NGUỒN trong tài liệu (mỗi mục {url, title}).
 7. Nội dung các trường phải là VĂN BẢN THUẦN — KHÔNG dùng ký hiệu markdown (**, *, #, ~~) hay thẻ HTML (<sub>, <b>...). Dùng gạch đầu dòng "- " và xuống dòng "\\n" nếu cần liệt kê.
 8. Đầu ra là JSON hợp lệ, KHÔNG markdown bao ngoài, KHÔNG text ngoài JSON.`,
@@ -4904,7 +5352,20 @@ ${raw || '(không có)'}
 """
 
 Dịch sang tiếng Việt và trả về JSON:
-{
+${laPhoiHop ? `{
+  "indications": "Chỉ định điều trị CỦA CHẾ PHẨM PHỐI HỢP (đầy đủ).",
+  "dosageAdministration": "Liều lượng và cách dùng CỦA CHẾ PHẨM PHỐI HỢP (đầy đủ mọi đối tượng, hiệu chỉnh liều, cách dùng).",
+  "pharmacokinetics": [
+    ${dsHoatChat.map((t) => `{ "drugName": "${t}", "absorption": "Hấp thu...", "distribution": "Phân bố...", "metabolism": "Chuyển hóa...", "elimination": "Thải trừ..." }`).join(',\n    ')}
+  ],
+  "pharmacodynamicsPerDrug": [
+    ${dsHoatChat.map((t) => `{ "drugName": "${t}", "text": "Nhóm dược lý, mã ATC, cơ chế tác dụng CỦA RIÊNG ${t}..." }`).join(',\n    ')}
+  ],
+  "pharmacodynamics": "Dược lực học CHUNG của chế phẩm phối hợp: vì sao phối hợp các hoạt chất này, có hiệp lực/bổ trợ gì không...",
+  "drugRelease": "Đặc điểm giải phóng thuốc của dạng bào chế.",
+  "excipients": ["Tá dược + vai trò"],
+  "sources": [{"url": "...", "title": "..."}]
+}` : `{
   "indications": "Chỉ định điều trị (đầy đủ).",
   "dosageAdministration": "Liều lượng và cách dùng (đầy đủ mọi đối tượng, hiệu chỉnh liều, cách dùng).",
   "pharmacokinetics": { "absorption": "Hấp thu...", "distribution": "Phân bố...", "metabolism": "Chuyển hóa...", "elimination": "Thải trừ..." },
@@ -4912,7 +5373,7 @@ Dịch sang tiếng Việt và trả về JSON:
   "drugRelease": "Đặc điểm giải phóng thuốc của dạng bào chế.",
   "excipients": ["Tá dược + vai trò"],
   "sources": [{"url": "...", "title": "..."}]
-}`,
+}`}`,
       },
     ], 'deepseek/deepseek-chat', 3, 16000);
 
@@ -4930,6 +5391,642 @@ Dịch sang tiếng Việt và trả về JSON:
   } catch (err) {
     console.error('[Clinical-info error]', err.message);
     updateProgress(searchId, 'clinical', 100, 'Lỗi tra cứu.');
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// BÁO CÁO KHẢ THI (biểu mẫu BM/QT/RD03.08) — các endpoint chuyên cho trang
+// "Thiết lập báo cáo khả thi". Phần lớn dữ liệu tái dùng endpoint sẵn có; ở đây chỉ là
+// những mục form cần mà chưa endpoint nào cung cấp: thị trường VN (kê khai + trúng thầu theo
+// năm), danh mục cấm Ấn Độ + đường dùng, kết luận tổng hợp, và xuất Word đúng mẫu.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Dạng bào chế (tiếng Việt chuẩn của app) → từ khoá khớp MỘT PHẦN với cột dang_bao_che trong
+// dữ liệu giá. Dữ liệu thật ghi dạng bào chế rất khác nhau ("Dung dịch tiêm", "Bột đông khô pha
+// tiêm"…) nên "Thuốc tiêm" phải rút xuống "tiêm" mới bắt được hết.
+function tuKhoaDangBaoCheVN(dosageForm) {
+  const vi = normalizeDosageForm(dosageForm).vi || '';
+  const map = {
+    'Thuốc tiêm': 'tiêm', 'Thuốc nhỏ mắt': 'nhỏ mắt', 'Viên nang mềm': 'nang mềm',
+    'Thuốc mỡ/Kem/Gel': '', // quá nhiều cách ghi (kem, mỡ, gel, thuốc bôi) → không lọc, tránh sót
+  };
+  return Object.prototype.hasOwnProperty.call(map, vi) ? map[vi] : vi;
+}
+
+// Tên hoạt chất người dùng gõ có thể khác cách cơ quan/nhà sản xuất ghi (Anh ↔ Việt, có/không muối,
+// đồng nghĩa guaifenesin/guaiphenesin, acetaminophen/paracetamol, sai chính tả nhẹ...). AI chỉ làm
+// việc ĐỀ XUẤT cách viết để tra; mọi kết quả vẫn phải có thật trong dữ liệu cổng, AI không sinh ra sản phẩm nào.
+const _bienTheCache = new Map();
+async function layBienTheHoatChat(ds, apiKey) {
+  const khoa = (t) => String(t).trim().toLowerCase();
+  const can = ds.filter((t) => !_bienTheCache.has(khoa(t)));
+  if (can.length && apiKey) {
+    try {
+      const text = await callOpenAI(apiKey, [
+        { role: 'system', content: 'Bạn là dược sĩ chuẩn hóa tên hoạt chất. Chỉ trả JSON hợp lệ, không giải thích.' },
+        { role: 'user', content: `Với mỗi tên hoạt chất người dùng nhập (có thể sai chính tả, viết kiểu Anh hoặc Việt, kèm muối), hãy trả về:
+- "inn": tên INN chuẩn (tiếng Anh, chữ thường, KHÔNG kèm muối/hydrat).
+- "bienThe": tối đa 5 cách viết CỦA CHÍNH HOẠT CHẤT ĐÓ mà cơ quan quản lý/nhà sản xuất Việt Nam có thể ghi: INN tiếng Anh, cách viết tiếng Việt hoá (đuôi -in, -id, -at...), tên đồng nghĩa THẬT SỰ (USAN/BAN/INN khác nhau, ví dụ acetaminophen = paracetamol, guaifenesin = guaiphenesin). Chữ thường, KHÔNG kèm muối/hydrat/hàm lượng.
+Quy tắc cứng: KHÔNG đưa tên hoạt chất KHÁC (kể cả cùng nhóm), KHÔNG đoán nếu không chắc — nếu không nhận ra tên, trả "bienThe": [] và "inn": "".
+Danh sách: ${JSON.stringify(can)}
+Định dạng: {"ketQua":[{"nhap":"...","inn":"...","bienThe":["..."]}]}` },
+      ], 'google/gemini-2.5-flash', 2, 4000);
+      const j = safeParseJSON(text);
+      (j.ketQua || []).forEach((k) => {
+        const goc = can.find((t) => khoa(t) === khoa(k.nhap));
+        if (!goc) return;
+        const v = [k.inn, ...(Array.isArray(k.bienThe) ? k.bienThe : [])].map((x) => String(x || '').toLowerCase().trim())
+          .filter((x) => x && x.length <= 40 && /^[a-z0-9\u00c0-\u1ef9 \-]+$/i.test(x));
+        _bienTheCache.set(khoa(goc), [...new Set(v)].slice(0, 6));
+      });
+    } catch (e) { console.warn('[bienThe] AI lỗi, dùng tên gốc:', e.message); }
+  }
+  return ds.map((t) => _bienTheCache.get(khoa(t)) || []);
+}
+
+// Bộ lọc dạng bào chế cho dữ liệu cổng Công bố thuốc: nhóm có nhiều cách gọi thì khớp RỘNG cả nhóm.
+// Cốm = thuốc cốm, cốm sủi, cốm pha hỗn dịch/dung dịch uống, thuốc bột uống/sủi/pha uống, hạt, pellet, granule…
+// (loại các dạng tiêm/đông khô/viên/dùng ngoài).
+function boLocDangDav(dosageForm) {
+  if ((normalizeDosageForm(dosageForm).vi || '') === 'Cốm') {
+    return {
+      any: ['cốm', 'thuốc bột', 'bột pha', 'bột sủi', 'bột uống', 'bột để uống', 'bột gói', 'hạt', 'pellet', 'granul'],
+      not: ['viên', 'tiêm', 'truyền', 'đông khô', 'nhỏ', 'dùng ngoài', 'xịt', 'hít', 'thụt', 'đặt'],
+    };
+  }
+  return tuKhoaDangBaoCheVN(dosageForm).replace(/[%,]/g, ' ').trim();
+}
+
+async function layTatCaDong(buildQuery, cap = 20000) {
+  const PAGE = 1000;
+  const out = [];
+  for (let from = 0; from < cap; from += PAGE) {
+    const { data, error } = await buildQuery().order('id', { ascending: true }).range(from, from + PAGE - 1);
+    if (error) throw new Error(error.message);
+    if (!data || !data.length) break;
+    out.push(...data);
+    if (data.length < PAGE) break;
+  }
+  return out;
+}
+
+// Danh sách TẤT CẢ giai đoạn trúng thầu đã nạp (mỗi năm 1 nhãn file) — để mục I.9 luôn liệt kê đủ các giai đoạn,
+// kể cả giai đoạn không có sản phẩm khớp (trước đây giai đoạn trống bị ẩn nên trông như "thiếu dữ liệu năm đó").
+let _giaiDoanCache = { ds: [], at: 0 };
+async function layTatCaGiaiDoanThau() {
+  if (_giaiDoanCache.ds.length && Date.now() - _giaiDoanCache.at < 3600 * 1000) return _giaiDoanCache.ds;
+  const namNay = new Date().getFullYear();
+  const nam = []; for (let y = 2020; y <= namNay; y++) nam.push(y);
+  const kq = await Promise.all(nam.map(async (y) => {
+    const { data } = await supabaseAdmin.from('drug_tender_prices').select('nguon_file').ilike('nguon_file', '%' + y + '%').limit(1);
+    return data && data[0] ? String(data[0].nguon_file).trim() : null;
+  }));
+  const ds = [...new Set(kq.filter(Boolean))];
+  if (ds.length) _giaiDoanCache = { ds, at: Date.now() };
+  return ds;
+}
+
+// I.1 sản phẩm cạnh tranh tại VN (giá kê khai) + I.9 trúng thầu theo từng giai đoạn.
+app.post('/api/feasibility/market', requireApprovedUser, async (req, res) => {
+  const searchIdM = req.body.searchId;
+  updateProgress(searchIdM, 'fz_market', 5, 'Đang chuẩn hoá tên hoạt chất...');
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    const kw = splitDrugKeywords(ghepTenHoatChat(ds));
+    const form = tuKhoaDangBaoCheVN(req.body.dosageForm).replace(/[%,]/g, ' ').trim();
+    const locDang = boLocDangDav(req.body.dosageForm);
+    const dangRong = typeof locDang === 'object' && locDang !== null;
+    const loc = (qb) => {
+      qb = applyDrugKeywordFilter(qb, kw);
+      if (dangRong) return qb.or(locDang.any.map((k) => `dang_bao_che.ilike.%${k}%`).join(','));
+      return form ? qb.ilike('dang_bao_che', `%${form}%`) : qb;
+    };
+    const dungDang = (r) => !dangRong || davsdk.khopDangBaoChe(r.dang_bao_che, locDang);
+
+    // I.1: tra TRỰC TIẾP danh sách thuốc đã cấp SĐK từ cổng "Công bố thuốc" của Cục QLD (đơn chất + phối hợp).
+    // Lỗi cổng → quay về dữ liệu giá kê khai bên dưới và nói rõ trong ghi chú.
+    let dav = null, ghiChuKeKhai = '';
+    try {
+      const bienThe = await layBienTheHoatChat(ds, req.body.openaiKey || process.env.OPENAI_API_KEY);
+      updateProgress(searchIdM, 'fz_market', 20, 'Đang tra cổng Công bố thuốc (Cục QLD)...');
+      dav = await davsdk.traSoDangKy(ds, boLocDangDav(req.body.dosageForm), undefined, bienThe);
+      updateProgress(searchIdM, 'fz_market', 55, 'Đã có danh sách số đăng ký, đang ghép giá kê khai...');
+    } catch (e) {
+      console.error('[feasibility/market] cổng Công bố thuốc lỗi:', e.message);
+      ghiChuKeKhai = `⚠️ Không truy cập được cổng Công bố thuốc (${e.message}) — hiển thị theo dữ liệu giá kê khai.`;
+    }
+
+    // Kho kê khai rỗng với hoạt chất này → thử lấy trực tiếp từ cổng Cục QLD (giống /api/price/search).
+    const { count: daCo } = dav ? { count: 1 } : await applyDrugKeywordFilter(
+      supabaseAdmin.from('drug_declared_prices').select('id', { count: 'exact', head: true }), kw);
+    if (!daCo) {
+      try {
+        const kwChinh = kw.slice().sort((a, b) => b.length - a.length)[0];
+        const fresh = await fetchDeclaredPricesFromDav(kwChinh);
+        if (fresh.length) {
+          const soDK = fresh.map((r) => r.so_dang_ky).filter(Boolean);
+          if (soDK.length) await supabaseAdmin.from('drug_declared_prices').delete().in('so_dang_ky', soDK);
+          for (let i = 0; i < fresh.length; i += 1000) await supabaseAdmin.from('drug_declared_prices').insert(fresh.slice(i, i + 1000));
+          ghiChuKeKhai = `Lấy trực tiếp từ Cục Quản lý Dược lúc ${new Date().toLocaleString('vi-VN')}`;
+        }
+      } catch (e) { ghiChuKeKhai = `⚠️ Không lấy được từ cổng Cục QLD: ${e.message}`; }
+    }
+
+    // Báo cáo ĐƠN chất: tra "paracetamol" khớp cả thuốc phối hợp (vd paracetamol + tramadol) — sai
+    // đối tượng so sánh nên loại bỏ các dòng có từ 2 hoạt chất trở lên. Báo cáo phối hợp: giữ nguyên
+    // (applyDrugKeywordFilter đã bắt buộc chứa ĐỦ mọi hoạt chất).
+    const laDonChat = ds.length === 1;
+    // Nhận diện phối hợp qua CẢ cột hoạt chất lẫn cột hàm lượng (nhiều dòng ghi hoạt chất gộp 1 chuỗi,
+    // thành phần chỉ lộ ở hàm lượng: "500 MG/30 MG", "500mg + 30mg"). Tránh nhầm hàm lượng siro "120mg/5ml".
+    const reHaiLieu = /\d\s*(?:mg|mcg|µg|g|iu|ui)\s*[/+;]\s*\d+(?:[.,]\d+)?\s*(?:mg|mcg|µg|g|iu|ui)\b/i;
+    const chiDonChat = (r) => !laDonChat
+      || (String(r.hoat_chat || '').split(/[+;]/).filter((x) => x.trim()).length <= 1
+          && !/[+;]/.test(String(r.ham_luong || '')) && !reHaiLieu.test(String(r.ham_luong || '')));
+    const keKhai = dav ? [] : (await layTatCaDong(() => loc(supabaseAdmin.from('drug_declared_prices')
+      .select('ten_thuoc,hoat_chat,ham_luong,dang_bao_che,quy_cach,nha_san_xuat,so_dang_ky,don_gia,id')))).filter(chiDonChat).filter(dungDang);
+    // Một số đăng ký có thể được kê khai nhiều lần/nhiều mức giá → mỗi SĐK lấy 1 dòng (giá thấp nhất).
+    const theoSDK = new Map();
+    for (const r of keKhai) {
+      const k = (r.so_dang_ky || '').trim() || `~${r.id}`;
+      const cu = theoSDK.get(k);
+      if (!cu || (Number(r.don_gia) > 0 && Number(r.don_gia) < Number(cu.don_gia || Infinity))) theoSDK.set(k, r);
+    }
+    let vnProducts = [...theoSDK.values()]
+      .sort((a, b) => String(a.ten_thuoc).localeCompare(String(b.ten_thuoc), 'vi'))
+      .map((r) => ({
+        tenThuoc: r.ten_thuoc, hamLuong: r.ham_luong, quyCach: r.quy_cach,
+        nhaSanXuat: r.nha_san_xuat, soDangKy: r.so_dang_ky, giaKeKhai: r.don_gia,
+      }));
+    let tongSoDangKy = new Set(vnProducts.map((p) => (p.soDangKy || '').trim()).filter(Boolean)).size;
+    let nguonI1 = 'Giá kê khai (Cục QLD)', soHetHieuLuc = 0, hanDungThamKhao = '';
+    if (dav) {
+      // Ghép giá kê khai theo số đăng ký (mỗi SĐK lấy giá thấp nhất); không có thì để trống.
+      const gia = new Map();
+      const dsSDK = [...new Set(dav.rows.map((r) => r.soDangKy).filter(Boolean))];
+      const manh = [];
+      for (let i = 0; i < dsSDK.length; i += 150) manh.push(dsSDK.slice(i, i + 150));
+      await Promise.all(manh.map(async (m) => {
+        const { data } = await supabaseAdmin.from('drug_declared_prices').select('so_dang_ky,don_gia').in('so_dang_ky', m);
+        (data || []).forEach((r) => {
+          const g = Number(r.don_gia);
+          if (g > 0 && (!gia.has(r.so_dang_ky) || g < gia.get(r.so_dang_ky))) gia.set(r.so_dang_ky, g);
+        });
+      }));
+      vnProducts = dav.rows.map((r) => Object.assign({}, r, { giaKeKhai: gia.get(r.soDangKy) != null ? gia.get(r.soDangKy) : null }));
+      tongSoDangKy = dav.tongHieuLuc;
+      soHetHieuLuc = dav.tongHetHan;
+      hanDungThamKhao = dav.hanDungThamKhao;
+      nguonI1 = 'Cổng Công bố thuốc – Cục Quản lý Dược';
+      // Quá nhiều sản phẩm trùng khớp → chỉ lấy 30 (ưu tiên số đăng ký còn hiệu lực); tổng số vẫn tính trên toàn bộ.
+      vnProducts = vnProducts.slice().sort((a, b) => (b.conHieuLuc ? 1 : 0) - (a.conHieuLuc ? 1 : 0));
+      ghiChuKeKhai = `Nguồn: cổng Công bố thuốc của Cục Quản lý Dược (dichvucong.dav.gov.vn/congbothuoc), tra lúc ${new Date().toLocaleString('vi-VN')}.`;
+    }
+
+    // I.9 trúng thầu: gom theo từng file nguồn (mỗi file = 1 giai đoạn). Năm KHÔNG có cột riêng.
+    const thau = (await layTatCaDong(() => loc(supabaseAdmin.from('drug_tender_prices')
+      .select('ten_thuoc,hoat_chat,ham_luong,dang_bao_che,so_dang_ky,so_luong,thanh_tien,nguon_file,id')))).filter(chiDonChat).filter(dungDang);
+    const theoGD = new Map();
+    for (const r of thau) {
+      const gd = (r.nguon_file || 'Không rõ nguồn').trim();
+      if (!theoGD.has(gd)) theoGD.set(gd, new Map());
+      const key = [r.ten_thuoc, r.ham_luong, r.so_dang_ky].map((x) => (x || '').trim()).join('|');
+      const m = theoGD.get(gd);
+      if (!m.has(key)) m.set(key, { tenThuoc: r.ten_thuoc, hamLuong: r.ham_luong, soDangKy: r.so_dang_ky, soLuong: 0, thanhTien: 0 });
+      const g = m.get(key);
+      g.soLuong += Number(r.so_luong) || 0;
+      g.thanhTien += Number(r.thanh_tien) || 0;
+    }
+    const namCuaGD = (s) => { const y = String(s).match(/20\d{2}/); return y ? Number(y[0]) : 9999; };
+    const tenderByPeriod = [...theoGD.entries()]
+      .sort((a, b) => namCuaGD(a[0]) - namCuaGD(b[0]))
+      .map(([giaiDoan, m]) => ({
+        giaiDoan,
+        rows: [...m.values()].sort((a, b) => b.thanhTien - a.thanhTien),
+      }));
+
+    // Bổ sung các giai đoạn không có sản phẩm khớp (rows rỗng) để người dùng thấy đã tra đủ cả 3 giai đoạn
+    try {
+      const tatCa = await layTatCaGiaiDoanThau();
+      for (const gd of tatCa) if (!tenderByPeriod.some((p) => p.giaiDoan === gd)) tenderByPeriod.push({ giaiDoan: gd, rows: [] });
+      tenderByPeriod.sort((a, b) => namCuaGD(a.giaiDoan) - namCuaGD(b.giaiDoan));
+    } catch (e) { console.warn('[feasibility] không lấy được danh sách giai đoạn thầu:', e.message); }
+    updateProgress(searchIdM, 'fz_market', 95, 'Đang tổng hợp trúng thầu theo giai đoạn...');
+    const tongSanPhamKhop = vnProducts.length;
+    vnProducts = vnProducts.slice(0, 30);
+    updateProgress(searchIdM, 'fz_market', 100, 'Hoàn thành.');
+    res.json({ vnProducts, tongSanPhamKhop, tongSoDangKy, soHetHieuLuc, hanDungThamKhao, nguonI1, tenderByPeriod, ghiChuKeKhai, dangBaoCheLoc: form, chiDonChat: laDonChat });
+  } catch (e) {
+    console.error('[feasibility/market]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// I.4 (cấm lưu hành Ấn Độ) + I.7 (đường dùng thực tế, đường tiêm/đau nếu là thuốc tiêm).
+const INDIA_BAN_URL = 'https://pharmawiki.in/list-of-drugs-banned-in-india-pdf-2018-329-full-list-recently-banned-drugs-news/';
+let _indiaBanCache = { text: '', at: 0 };
+async function layDanhSachCamAnDo() {
+  if (_indiaBanCache.text && Date.now() - _indiaBanCache.at < 7 * 24 * 3600 * 1000) return _indiaBanCache.text;
+  let text = '';
+  try {
+    const r = await axios.get(INDIA_BAN_URL, { timeout: 30000,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36' } });
+    const cheerio = require('cheerio');
+    const $ = cheerio.load(r.data);
+    $('script,style,nav,footer').remove();
+    text = $('body').text().replace(/\s+/g, ' ');
+  } catch (e) {
+    // Trang chặn IP máy chủ (403/Cloudflare) → nhờ Serper tải hộ từ hạ tầng của họ.
+    const serperKey = process.env.SERPER_API_KEY;
+    if (!serperKey) throw e;
+    const r2 = await axios.post('https://scrape.serper.dev', { url: INDIA_BAN_URL },
+      { headers: { 'X-API-KEY': serperKey, 'Content-Type': 'application/json' }, timeout: 45000 });
+    text = String((r2.data && r2.data.text) || '').replace(/\s+/g, ' ');
+  }
+  if (text.length < 2000) throw new Error('Trang nguồn trả về quá ngắn (có thể bị chặn).');
+  _indiaBanCache = { text, at: Date.now() };
+  return text;
+}
+
+app.post('/api/feasibility/extra', requireApprovedUser, async (req, res) => {
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+    const norm = normalizeDosageForm(req.body.dosageForm);
+    const laTiem = norm.vi === 'Thuốc tiêm';
+
+    // ── I.4: tra danh sách cấm ──
+    const indiaBan = { status: 'unavailable', matches: [], sourceUrl: INDIA_BAN_URL, note: '' };
+    try {
+      // Chỉ báo "bị cấm" khi THÀNH PHẦN KHỚP HOÀN TOÀN một tổ hợp trong danh sách (mọi hoạt chất nhập đều có trong
+      // tổ hợp VÀ tổ hợp không có hoạt chất nào khác). Trùng một phần thì coi là không nằm trong danh mục.
+      let danhSach = [];
+      let nguonDS = '';
+      try { danhSach = indiaban.phanTichDanhSach(await layDanhSachCamAnDo()); } catch (e) { console.warn('[India] tải trang lỗi:', e.message); }
+      if (danhSach.length < 250) {
+        // Trang bị chặn (403) hoặc đổi cấu trúc → dùng bản lưu cục bộ của danh sách (công bố 12/9/2018)
+        _indiaBanCache = { text: '', at: 0 };
+        try { danhSach = indiaban.phanTichDanhSach(require('fs').readFileSync(path.join(__dirname, 'data', 'india-banned-fdc-2018.txt'), 'utf8')); nguonDS = ' (đối chiếu theo bản lưu cục bộ của danh sách công bố 12/9/2018)'; } catch (e) { /* bỏ qua */ }
+      }
+      if (danhSach.length < 250) throw new Error(`chỉ đọc được ${danhSach.length} mục của danh sách (cấu trúc trang có thể đã đổi)`);
+      const bienThe = await layBienTheHoatChat(ds, openaiKey);
+      const khop = indiaban.kiemTra(danhSach, ds.map((t, i) => indiaban.nhomGoc(t, bienThe[i])));
+      indiaBan.matches = khop.map((e) => `STT ${e.stt}: ${e.ten}`);
+      indiaBan.status = khop.length ? 'found-all' : 'not-found';
+      indiaBan.note = khop.length
+        ? `Thành phần KHỚP HOÀN TOÀN với tổ hợp bị cấm trong danh sách ${danhSach.length} mục${nguonDS}.`
+        : `Không nằm trong danh mục cấm: không có tổ hợp nào trong danh sách ${danhSach.length} mục khớp hoàn toàn thành phần (trùng một phần hoạt chất không tính)${nguonDS}.`;
+    } catch (e) {
+      indiaBan.note = `Không tải được danh sách: ${e.message}`;
+    }
+
+    // ── I.7: đường dùng (+ tiêm) ──
+    let routeInfo = { duongDung: '', injectionRoutes: [], painAssessment: '', analgesicNote: '', sources: [] };
+    if (openaiKey) {
+      try {
+        const text = await callOpenAI(openaiKey, [
+          { role: 'system', content: `Bạn là chuyên gia dược lâm sàng & bào chế, có khả năng tìm kiếm web thời gian thực. Trả lời TIẾNG VIỆT, KHÔNG bịa: chỉ nêu điều có trong tài liệu thật (nhãn FDA/SmPC/dược thư), kèm URL thật trong "sources". Mục nào không tìm được tài liệu thì để chuỗi rỗng / mảng rỗng. Đầu ra CHỈ là JSON hợp lệ, không markdown.` },
+          { role: 'user', content: `Thuốc: "${ghepTenHoatChat(ds)}", dạng bào chế: ${norm.vi} (${norm.en}).
+Trả JSON:
+{
+  "duongDung": "Đường dùng chính trên thực tế lâm sàng của dạng bào chế này (vd uống, tiêm tĩnh mạch...)",
+  "injectionRoutes": [${laTiem ? '"chỉ chọn trong: Tiêm tĩnh mạch | Tiêm dưới da | Tiêm bắp | Tiêm trong da — những đường được nhãn thuốc cho phép"' : ''}],
+  "painAssessment": "${laTiem ? 'Đánh giá khả năng gây đau khi tiêm: bản chất hoạt chất, đường tiêm, độ đẳng trương, pH, loại đệm/dung lượng đệm, tá dược (chỉ dựa tài liệu)' : ''}",
+  "analgesicNote": "${laTiem ? 'Định hướng có/không dùng chất giảm đau tại chỗ trong công thức, kèm tài liệu tham khảo' : ''}",
+  "sources": [{"url": "URL thật", "title": "tên tài liệu"}]
+}` },
+        ], 'deepseek/deepseek-chat:online', 3, 8000);
+        const p = safeParseJSON(text);
+        routeInfo = {
+          duongDung: p.duongDung || '',
+          injectionRoutes: laTiem && Array.isArray(p.injectionRoutes) ? p.injectionRoutes : [],
+          painAssessment: laTiem ? (p.painAssessment || '') : '',
+          analgesicNote: laTiem ? (p.analgesicNote || '') : '',
+          sources: Array.isArray(p.sources) ? p.sources : [],
+        };
+      } catch (e) { routeInfo.note = `Lỗi tra đường dùng: ${e.message}`; }
+    }
+    res.json({ indiaBan, routeInfo, laTiem });
+  } catch (e) {
+    console.error('[feasibility/extra]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// II.3' / II.4 / IV: tổng hợp từ DỮ LIỆU ĐÃ THU (client gửi `collected`), AI không được thêm dữ kiện ngoài đó.
+// Kết luận dự phòng — dựng thuần từ DỮ LIỆU ĐÃ THU (facts), không suy diễn thêm; dùng khi AI lỗi hoặc bỏ trống ô
+function ketLuanDuPhong(f, tenHC, dangVi) {
+  const dsStr = (a) => (Array.isArray(a) ? a.filter(Boolean) : []);
+  const hl = dsStr(f.hamLuongPhoBien);
+  const qc = dsStr(f.quyCachPhoBien);
+  const thieu = 'Chưa đủ dữ liệu công bố để kết luận mục này — cần khảo sát thêm trong giai đoạn nghiên cứu.';
+  const on = [f.tomTatOnDinh, f.tomTatTuongKy].filter(Boolean).join(' ');
+  return {
+    pharmaNotes: on || ('Chưa thu được dữ liệu độ ổn định/tương kỵ đủ để đưa lưu ý riêng cho ' + tenHC + '; cần khảo sát độ ổn định (nhiệt, ẩm, ánh sáng, pH) và tương kỵ tá dược/bao bì ở giai đoạn thử nghiệm.'),
+    studyPlan: {
+      dangBaoChe: dangVi,
+      hamLuong: hl.length ? 'Theo các sản phẩm đang lưu hành tại Việt Nam: ' + hl.slice(0, 3).join('; ') : thieu,
+      quyCachDongThu: qc.length ? 'Tham khảo quy cách phổ biến: ' + qc.slice(0, 3).join('; ') : thieu,
+      baoBiDongThu: f.goiYBaoBi || 'Chưa có căn cứ độ ổn định để chỉ định bao bì đặc biệt (túi nhôm, sục N₂); chọn bao bì theo quy cách phổ biến trên thị trường và xác nhận bằng nghiên cứu độ ổn định.',
+    },
+    conclusion: {
+      hamLuongDangBaoCheLieuDung: [dangVi + ' ' + tenHC, hl.length ? 'hàm lượng tham khảo: ' + hl.slice(0, 2).join('; ') : '', f.lieuDung ? 'liều dùng tham khảo: ' + String(f.lieuDung).slice(0, 250) : ''].filter(Boolean).join(' — '),
+      tenDuKien: (tenHC + ' ' + (hl[0] || '') + ' ' + dangVi).replace(/\s+/g, ' ').trim() + ' (gợi ý, nghiên cứu viên đặt tên chính thức)',
+      quyCachDongGoi: qc.length ? 'Gợi ý theo quy cách phổ biến: ' + qc.slice(0, 2).join('; ') + '. ' + (f.goiYBaoBi || 'Việc dùng túi nhôm / sục N₂ cần được quyết định sau khi có kết quả độ ổn định.') : (f.goiYBaoBi || thieu),
+      ppKiemNghiem: f.ppKiemNghiem || 'Phương pháp kiểm nghiệm dự kiến: theo chuyên luận dược điển của hoạt chất/dạng bào chế (đã chọn ở mục tiêu chuẩn); định lượng thường bằng HPLC — cần thẩm định phương pháp.',
+      deXuatKhac: [f.canhBaoThiTruong, f.tomTatXuatXu, f.tomTatBhyt, f.camAnDo].filter(Boolean).join(' ') || 'Rà soát thêm sản phẩm cạnh tranh, giá trúng thầu và yêu cầu đăng ký trước khi quyết định triển khai.',
+    },
+    refShelfLife: f.hanDungThamKhao || '',
+  };
+}
+const _trong = (v) => v == null || (typeof v === 'string' && !v.trim());
+function tronKetLuan(ai, dp) {
+  const out = JSON.parse(JSON.stringify(dp));
+  if (ai && typeof ai === 'object') {
+    if (!_trong(ai.pharmaNotes)) out.pharmaNotes = ai.pharmaNotes;
+    for (const k of Object.keys(out.studyPlan)) if (ai.studyPlan && !_trong(ai.studyPlan[k])) out.studyPlan[k] = ai.studyPlan[k];
+    for (const k of Object.keys(out.conclusion)) if (ai.conclusion && !_trong(ai.conclusion[k])) out.conclusion[k] = ai.conclusion[k];
+    if (!_trong(ai.refShelfLife)) out.refShelfLife = ai.refShelfLife;
+  }
+  return out;
+}
+
+app.post('/api/feasibility/conclusion', requireApprovedUser, async (req, res) => {
+  const searchIdK = req.body.searchId;
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    const norm = normalizeDosageForm(req.body.dosageForm);
+    const collected = String(req.body.collected || '').slice(0, 40000);
+    const facts = (req.body.facts && typeof req.body.facts === 'object') ? req.body.facts : {};
+    const tenHC = ghepTenHoatChat(ds);
+    const duPhong = ketLuanDuPhong(facts, tenHC, norm.vi);
+    updateProgress(searchIdK, 'fz_conclusion', 15, 'DeepSeek đang đọc toàn bộ dữ liệu đã thu...');
+    let ai = null, nguon = 'tong-hop-tu-du-lieu', loiAI = '';
+    if (openaiKey) {
+      try {
+        const text = await callOpenAI(openaiKey, [
+          { role: 'system', content: `Bạn là trưởng nhóm nghiên cứu bào chế tại công ty dược Việt Nam, viết phần KẾT LUẬN & ĐỀ XUẤT của báo cáo khả thi sản phẩm mới.
+Hãy ĐỌC TOÀN BỘ dữ liệu đã thu (thị trường, đăng ký, trúng thầu, chỉ định/liều, độ ổn định, tương kỵ, công thức tham chiếu, tiêu chuẩn, BHYT, xuất xứ SRA, cấm Ấn Độ...) rồi đưa ra kết luận CỤ THỂ, đầy đủ, KHÔNG ĐƯỢC ĐỂ TRỐNG ô nào.
+QUY TẮC: dựa trên dữ liệu đã thu; KHÔNG bịa số liệu, hàm lượng, tên thương mại có thật, hạn dùng. Mục nào dữ liệu không đủ thì vẫn viết 1–2 câu nêu rõ thiếu gì và đề xuất việc cần làm (không để chuỗi rỗng). Trả lời TIẾNG VIỆT, văn phong báo cáo kỹ thuật. KHÔNG dùng LaTeX/markdown.` },
+          { role: 'user', content: `Sản phẩm: ${tenHC} — ${norm.vi} (${norm.en}).
+
+DỮ LIỆU ĐÃ THU (văn bản):
+"""
+${collected}
+"""
+DỮ LIỆU CÓ CẤU TRÚC (JSON): ${JSON.stringify(facts).slice(0, 6000)}
+
+Trả JSON hợp lệ, MỌI trường phải có nội dung:
+{
+  "pharmaNotes": "Những lưu ý trong quá trình pha chế ảnh hưởng chất lượng và tính tương kỵ của bao bì với hoạt chất/tá dược (dựa trên độ ổn định, tương kỵ đã thu).",
+  "studyPlan": { "dangBaoChe": "", "hamLuong": "", "quyCachDongThu": "", "baoBiDongThu": "" },
+  "conclusion": {
+    "hamLuongDangBaoCheLieuDung": "hàm lượng hoạt chất, dạng bào chế cụ thể, liều dùng sản phẩm đề xuất",
+    "tenDuKien": "GỢI Ý tên chế phẩm (vd 'Tên hoạt chất + hàm lượng + dạng bào chế'), nghiên cứu viên sẽ đặt tên chính thức",
+    "quyCachDongGoi": "dự kiến quy cách; có túi nhôm không? có sục N2 không? (căn cứ độ ổn định đã thu)",
+    "ppKiemNghiem": "phương pháp kiểm nghiệm dự kiến (vd HPLC) và khó khăn nếu có",
+    "deXuatKhac": "đề xuất khác: cạnh tranh, giá thầu, BHYT, đăng ký, rủi ro/khả thi tổng thể"
+  },
+  "refShelfLife": "hạn dùng sản phẩm tham khảo nếu có trong dữ liệu, nếu không thì chuỗi rỗng"
+}` },
+        ], 'deepseek/deepseek-chat', 3, 7000);
+        updateProgress(searchIdK, 'fz_conclusion', 85, 'Đang xử lý kết luận...');
+        ai = safeParseJSON(text);
+        nguon = 'deepseek';
+      } catch (e) { loiAI = e.message; console.error('[feasibility/conclusion] DeepSeek lỗi → dùng bản tổng hợp từ dữ liệu:', e.message); }
+    } else { loiAI = 'Thiếu API key AI'; }
+    const kq = sanDeep(tronKetLuan(ai, duPhong));
+    kq.nguonKetLuan = nguon;
+    if (nguon !== 'deepseek') kq.ghiChuNguon = 'Kết luận được tổng hợp trực tiếp từ dữ liệu đã thu vì AI chưa phản hồi (' + loiAI + ').';
+    updateProgress(searchIdK, 'fz_conclusion', 100, 'Hoàn thành.');
+    res.json(kq);
+  } catch (e) {
+    console.error('[feasibility/conclusion]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// II.2 — công thức hàng tham chiếu thay thế khi Vidal.ru không có tá dược: FDA (DailyMed) → eMC (SmPC Anh) → AI tìm web
+async function ganVaiTroTaDuoc(openaiKey, names) {
+  const uniq = [...new Set(names.map((n) => String(n).trim()).filter(Boolean))].slice(0, 60);
+  if (!uniq.length || !openaiKey) return {};
+  try {
+    const text = await callOpenAI(openaiKey, [
+      { role: 'system', content: 'Bạn là dược sĩ bào chế. Chỉ trả JSON hợp lệ.' },
+      { role: 'user', content: `Với mỗi tên tá dược (tiếng Anh) dưới đây, ghi VAI TRÒ THÔNG DỤNG trong công thức bằng tiếng Việt ngắn (vd: chất độn, chất rã, chất trơn, chất kết dính, chất bao phim, chất tạo màu, chất bảo quản, chất điều vị, chất tạo ngọt, chất điều chỉnh pH, dung môi, chất ổn định/tạo độ nhớt, chất làm bóng...). Nếu không chắc thì để chuỗi rỗng. Danh sách: ${JSON.stringify(uniq)}
+Định dạng: {"tên tá dược nguyên văn": "vai trò"}` },
+    ], 'deepseek/deepseek-chat', 2, 3000);
+    return safeParseJSON(text) || {};
+  } catch (e) { return {}; }
+}
+
+app.post('/api/feasibility/reference-formula', requireApprovedUser, async (req, res) => {
+  const searchIdR = req.body.searchId;
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    const openaiKey = req.body.openaiKey || process.env.OPENAI_API_KEY;
+    const dangVi = normalizeDosageForm(req.body.dosageForm).vi || '';
+    updateProgress(searchIdR, 'fz_ref', 10, 'Đang chuẩn hoá tên hoạt chất...');
+    const bienThe = await layBienTheHoatChat(ds, openaiKey);
+    const nhom = ds.map((t, i) => refformula.nhomGoc(t, bienThe[i]));
+    updateProgress(searchIdR, 'fz_ref', 25, 'Đang tra nhãn thuốc FDA (DailyMed)...');
+    const [fda, emc] = await Promise.all([
+      refformula.traOpenFDA(axios, ds, bienThe, nhom, dangVi).catch((e) => ({ san: [], loi: e.message })),
+      refformula.traEmc(axios, ds, nhom, dangVi, process.env.SERPER_API_KEY).catch((e) => ({ san: [], loi: e.message })),
+    ]);
+    updateProgress(searchIdR, 'fz_ref', 60, 'Đã tra FDA và eMC (SmPC Anh).');
+    let products = [...emc.san, ...fda.san];
+    const nguonDaTra = ['FDA – DailyMed', 'eMC – SmPC Anh'];
+    // Không có ở nguồn SRA → nhờ AI tìm web (chưa kiểm chứng, gắn nhãn rõ)
+    if (!products.length && openaiKey) {
+      updateProgress(searchIdR, 'fz_ref', 65, 'Không có ở FDA/eMC — AI đang tìm trên web (SmPC/EPAR/nhãn)...');
+      nguonDaTra.push('AI tìm web (chưa kiểm chứng)');
+      try {
+        const text = await callOpenAI(openaiKey, [
+          { role: 'system', content: 'Bạn là dược sĩ bào chế có khả năng tìm web thời gian thực. CHỈ nêu tá dược có trong tài liệu chính thức bạn đã đọc; KHÔNG bịa. Trả JSON hợp lệ.' },
+          { role: 'user', content: `Tìm CÔNG THỨC (danh sách tá dược) của chế phẩm tham chiếu: ${ghepTenHoatChat(ds)}, dạng bào chế ${dangVi}. Ưu tiên SmPC (EMA/MHRA/eMC), EPAR, nhãn FDA, PIL của nước thuộc nhóm SRA.
+CHỈ lấy tài liệu của ĐÚNG dạng bào chế "${dangVi}" (vd cốm/granules ≠ viên nén ≠ viên nang); khác dạng thì BỎ QUA.
+Trả JSON: {"products":[{"productName":"","country":"","dosageForm":"dạng bào chế CHÍNH XÁC ghi trong tài liệu (tiếng Anh)","sourceUrl":"URL THẬT đã đọc","excipients":["tên tá dược (tiếng Anh)"]}]}
+Không tìm thấy tài liệu đúng dạng và có liệt kê tá dược thì trả {"products":[]}.` },
+        ], 'deepseek/deepseek-chat:online', 2, 5000);
+        const j = safeParseJSON(text) || {};
+        products = (j.products || []).filter((p) => p && p.sourceUrl && /^https?:\/\//.test(p.sourceUrl) && Array.isArray(p.excipients) && p.excipients.length && refformula.khopDangEn(dangVi, p.dosageForm || p.productName)).slice(0, 3).map((p) => ({
+          productName: p.productName || 'Chế phẩm tham chiếu', nhaSanXuat: '', source: 'AI tìm web — chưa kiểm chứng, cần đối chiếu nguồn', country: p.country || '', sra: null, kiemChung: false,
+          sourceUrl: p.sourceUrl, excipients: p.excipients.map((n) => ({ name: String(n), amount: '', role: '' })),
+        }));
+      } catch (e) { console.warn('[reference-formula] AI web lỗi:', e.message); }
+    }
+    updateProgress(searchIdR, 'fz_ref', 80, 'Đang ghi vai trò tá dược...');
+    const vaiTro = await ganVaiTroTaDuoc(openaiKey, products.flatMap((p) => p.excipients.map((e) => e.name)));
+    products.forEach((p) => p.excipients.forEach((e) => { e.role = vaiTro[e.name] || ''; }));
+    updateProgress(searchIdR, 'fz_ref', 100, 'Hoàn thành.');
+    res.json({ products, nguonDaTra, loi: [fda.loi, emc.loi].filter(Boolean).join('; ') });
+  } catch (e) {
+    console.error('[feasibility/reference-formula]', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Xuất Word đúng bố cục biểu mẫu. Client dựng sẵn danh sách `items` theo đúng thứ tự & đánh số của
+// form (kể cả nội dung đã sửa tay), server chỉ việc dàn trang → thay đổi bố cục chỉ sửa ở client.
+// Kiểu item: h1 | h2 | p | note | table | checks | structure | sign
+app.post('/api/feasibility/export', requireApprovedUser, async (req, res) => {
+  try {
+    const { meta = {}, items = [] } = req.body || {};
+    if (!Array.isArray(items) || !items.length) return res.status(400).json({ error: 'Chưa có nội dung để xuất.' });
+    const fs = require('fs');
+    const path = require('path');
+    const {
+      Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, ImageRun,
+      AlignmentType, WidthType, BorderStyle, VerticalAlign,
+    } = docx;
+    const FONT = 'Times New Roman';
+    const line = { style: BorderStyle.SINGLE, size: 4, color: '000000' };
+    const borders = { top: line, bottom: line, left: line, right: line, insideHorizontal: line, insideVertical: line };
+    const noLine = { style: BorderStyle.NONE, size: 0, color: 'FFFFFF' };
+
+    const runs = (text, o = {}) => String(text == null ? '' : text).split('\n')
+      .map((ln, i) => new TextRun(Object.assign({ text: ln, font: FONT, size: 22, break: i > 0 ? 1 : 0 }, o)));
+    const cell = (text, o = {}) => new TableCell({
+      width: o.width ? { size: o.width, type: WidthType.PERCENTAGE } : undefined,
+      columnSpan: o.span, verticalAlign: VerticalAlign.CENTER,
+      shading: o.header ? { fill: 'F2F2F2' } : undefined,
+      margins: { top: 50, bottom: 50, left: 90, right: 90 },
+      children: [new Paragraph({ alignment: o.center || o.header ? AlignmentType.CENTER : AlignmentType.LEFT,
+        children: runs(text, { bold: !!o.bold || !!o.header }) })],
+    });
+    const children = [];
+
+    // ── Khung tiêu đề (logo | tên công ty + báo cáo | mã biểu mẫu) ──
+    let logoRun = null;
+    try {
+      const p = path.join(__dirname, 'public', 'assets', 'cpc1hn-logo.png');
+      if (fs.existsSync(p)) logoRun = new ImageRun({ type: 'png', data: fs.readFileSync(p), transformation: { width: 70, height: 70 } });
+    } catch (_) { /* không có logo thì bỏ qua */ }
+    const cc = (kids, w) => new TableCell({ width: { size: w, type: WidthType.PERCENTAGE }, verticalAlign: VerticalAlign.CENTER,
+      margins: { top: 60, bottom: 60, left: 90, right: 90 }, children: kids });
+    const pc = (t, o = {}) => new Paragraph({ alignment: o.left ? AlignmentType.LEFT : AlignmentType.CENTER, children: runs(t, Object.assign({ bold: true }, o.run || {})) });
+    children.push(new Table({
+      width: { size: 100, type: WidthType.PERCENTAGE }, borders,
+      rows: [new TableRow({ children: [
+        cc([new Paragraph({ alignment: AlignmentType.CENTER, children: logoRun ? [logoRun] : runs('') })], 16),
+        cc([
+          pc('CÔNG TY CỔ PHẦN DƯỢC PHẨM CPC1 HÀ NỘI', { run: { size: 24 } }),
+          pc('BÁO CÁO SƠ BỘ NGHIÊN CỨU VÀ\nTÍNH KHẢ THI CỦA SẢN PHẨM MỚI', { run: { size: 24 } }),
+          pc(`Tên sản phẩm: ${meta.tenSanPham || ''}`),
+          pc(`Hoạt chất: ${meta.hoatChat || ''}`),
+        ], 58),
+        cc([
+          pc('BM/QT/RD03.08', { left: true }),
+          pc(`Ngày BH biểu mẫu:\n01/02/2024`, { left: true }),
+          pc('Bộ phận: RD', { left: true }),
+          pc(`Số: ${meta.so || '04'}`, { left: true }),
+          new Paragraph({ children: runs(`Ngày: ${meta.ngay || ''}`) }),
+        ], 26),
+      ] })],
+    }));
+    children.push(new Paragraph({ text: '', spacing: { after: 120 } }));
+
+    // Ảnh công thức cấu tạo: lấy PNG từ PubChem theo TÊN (SVG của ChEMBL không nhúng được vào Word).
+    const layPNG = async (ten) => {
+      try {
+        const r = await axios.get(`https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(ten)}/PNG?image_size=300x300`,
+          { responseType: 'arraybuffer', timeout: 15000 });
+        return Buffer.from(r.data);
+      } catch (_) { return null; }
+    };
+
+    for (const it of items) {
+      if (it.type === 'h1') {
+        children.push(new Paragraph({ spacing: { before: 240, after: 100 }, children: runs(it.text, { bold: true, size: 24 }) }));
+      } else if (it.type === 'h2') {
+        children.push(new Paragraph({ spacing: { before: 160, after: 60 }, children: runs(it.text, { bold: true, italics: !!it.italic, size: 23 }) }));
+      } else if (it.type === 'p' || it.type === 'note') {
+        String(it.text || '').split('\n').forEach((ln) => children.push(new Paragraph({
+          spacing: { after: 40 }, children: runs(ln, { italics: it.type === 'note', size: 22, bold: !!it.bold }) })));
+      } else if (it.type === 'table') {
+        const headers = Array.isArray(it.headers) ? it.headers : [];
+        const n = headers.length || (it.rows[0] ? it.rows[0].length : 1);
+        const w = Array.isArray(it.widths) && it.widths.length === n ? it.widths : headers.map(() => Math.floor(100 / n));
+        const rows = [];
+        if (it.title) rows.push(new TableRow({ children: [cell(it.title, { header: true, span: n })] }));
+        if (headers.length) rows.push(new TableRow({ tableHeader: true, children: headers.map((h, i) => cell(h, { header: true, width: w[i] })) }));
+        (it.rows || []).forEach((r) => {
+          // Dòng tiêu đề nhóm ("§Đặc tính lý hóa"): 1 ô in đậm trải hết các cột.
+          if (String(r[0] || '').startsWith('§')) { rows.push(new TableRow({ children: [cell(String(r[0]).slice(1), { bold: true, span: n })] })); return; }
+          rows.push(new TableRow({ children: headers.map((_, i) => cell(r[i] == null ? '' : String(r[i]), { width: w[i] })) }));
+        });
+        if (it.footer) rows.push(new TableRow({ children: [cell(it.footer, { bold: true, span: n })] }));
+        children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, borders, rows }));
+        children.push(new Paragraph({ text: '', spacing: { after: 80 } }));
+      } else if (it.type === 'checks') {
+        if (it.label) children.push(new Paragraph({ spacing: { after: 40 }, children: runs(it.label, { size: 22 }) }));
+        children.push(new Paragraph({ spacing: { after: 60 }, children: runs(
+          (it.options || []).map((o) => `${o.checked ? '☒' : '☐'} ${o.label}`).join('      '), { size: 22, bold: true }) }));
+      } else if (it.type === 'structure') {
+        const buf = await layPNG(it.name);
+        if (buf) children.push(new Paragraph({ children: [new ImageRun({ type: 'png', data: buf, transformation: { width: 200, height: 200 } })] }));
+        else children.push(new Paragraph({ children: runs('(Chưa lấy được ảnh công thức cấu tạo — chèn thủ công)', { italics: true }) }));
+      } else if (it.type === 'sign') {
+        children.push(new Paragraph({ alignment: AlignmentType.RIGHT, spacing: { before: 240, after: 80 }, children: runs(it.place || 'CPC1 HN, Ngày ... tháng ... năm 202', { size: 22 }) }));
+        const roles = ['Người phê duyệt', 'Người kiểm tra', 'Nghiên cứu viên'];
+        children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, borders, rows: [
+          new TableRow({ children: roles.map((r) => cell(r, { header: true, width: 33 })) }),
+          new TableRow({ height: { value: 1100, rule: 'atLeast' }, children: roles.map((_, i) => cell((it.comments && it.comments[i]) || '', { width: 33 })) }),
+        ] }));
+      }
+    }
+
+    const document = new Document({
+      styles: { default: { document: { run: { font: FONT, size: 22 } } } },
+      sections: [{ properties: { page: { margin: { top: 900, bottom: 900, left: 1100, right: 1000 } } }, children }],
+    });
+    const buffer = await Packer.toBuffer(document);
+    const safe = (meta.hoatChat || 'san_pham').toString().normalize('NFD').replace(/[^\x00-\x7F]/g, '')
+      .replace(/[^\w\-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || 'san_pham';
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+    res.setHeader('Content-Disposition', `attachment; filename="BCKT_${safe}.docx"`);
+    res.send(buffer);
+  } catch (err) {
+    console.error('Lỗi xuất báo cáo khả thi:', err);
+    res.status(500).json({ error: 'Không tạo được file Word: ' + err.message });
+  }
+});
+
+// I.8 — Tra danh mục thuốc BHYT (TT 20/2022/TT-BYT, Phụ lục I) theo tên hoạt chất
+app.post('/api/feasibility/bhyt', requireApprovedUser, async (req, res) => {
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    let kq = bhyt.traCuu(ds);
+    if (!kq.khopDayDu.length) {
+      const bt = await layBienTheHoatChat(ds, req.body.openaiKey || process.env.OPENAI_API_KEY);
+      const thu = ds.map((t, i) => (bt[i] && bt[i][0]) || t);
+      if (thu.join('|').toLowerCase() !== ds.join('|').toLowerCase()) kq = bhyt.traCuu(thu);
+    }
+    res.json(Object.assign({ nguon: 'Thông tư 20/2022/TT-BYT, Phụ lục I' }, kq));
+  } catch (err) {
+    console.error('Lỗi tra BHYT:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// I.2 — Xuất xứ công thức theo "Danh mục thuốc tham chiếu" (TT 08/2022/TT-BYT): nước/cơ quan SRA
+app.post('/api/feasibility/origin', requireApprovedUser, async (req, res) => {
+  try {
+    const ds = layDanhSachHoatChat(req.body);
+    if (!ds.length) return res.status(400).json({ error: 'Thiếu tên hoạt chất' });
+    const bienThe = await layBienTheHoatChat(ds, req.body.openaiKey || process.env.OPENAI_API_KEY);
+    const dangVi = normalizeDosageForm(req.body.dosageForm).vi || '';
+    const kq = thamchieu.traCuu(ds, bienThe, dangVi);
+    res.json(Object.assign({ nguon: 'Danh mục thuốc tham chiếu (khoản 9, điều 2, TT 08/2022/TT-BYT) — file ngày 5-7-2024', tomTat: thamchieu.tomTat(kq.khop), dangVi }, kq));
+  } catch (err) {
+    console.error('Lỗi tra xuất xứ công thức:', err);
     res.status(500).json({ error: err.message });
   }
 });

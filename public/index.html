@@ -9,7 +9,7 @@
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='88'>💊</text></svg>" />
   <title>Hỗ trợ nghiên cứu – Tra cứu nghiên cứu dược phẩm</title>
   <meta name="description" content="Nền tảng nghiên cứu dược phẩm tích hợp AI: phân tích hoạt chất, tra cứu công thức tham khảo đề xuất, tìm kiếm patent thuốc gốc." />
-  <link rel="stylesheet" href="style.css" />
+  <link rel="stylesheet" href="style.css?v=20261009f" />
 </head>
 <body>
 <div class="app-wrapper">
@@ -43,9 +43,13 @@
     </div>
 
     <nav class="sidebar-nav">
-      <button class="sidebar-nav-btn active" id="sidebar-setup-btn" onclick="switchPage('page-setup', this)" title="Thiết lập báo cáo khả thi">
-        <span class="sidebar-nav-icon">🧪</span>
+      <button class="sidebar-nav-btn" id="sidebar-feasibility-btn" onclick="switchPage('page-feasibility', this)" title="Thiết lập báo cáo khả thi">
+        <span class="sidebar-nav-icon">📊</span>
         <span class="sidebar-nav-label">Thiết lập báo cáo khả thi</span>
+      </button>
+      <button class="sidebar-nav-btn active" id="sidebar-setup-btn" onclick="switchPage('page-setup', this)" title="Thiết lập protocol nghiên cứu">
+        <span class="sidebar-nav-icon">🧪</span>
+        <span class="sidebar-nav-label">Thiết lập protocol nghiên cứu</span>
       </button>
       <button class="sidebar-nav-btn" id="sidebar-history-btn" onclick="switchPage('page-history', this); loadHistoryTab();" title="Lịch sử">
         <span class="sidebar-nav-icon">🕘</span>
@@ -54,6 +58,11 @@
       <button class="sidebar-nav-btn" id="sidebar-psel-btn" onclick="switchPage('page-product-selection', this); loadProductSelection();" title="Lựa chọn sản phẩm">
         <span class="sidebar-nav-icon">🎯</span>
         <span class="sidebar-nav-label">Lựa chọn sản phẩm</span>
+      </button>
+      <!-- Mọi người đã đăng nhập đều xem được (không ẩn như nút Quản trị bên dưới) -->
+      <button class="sidebar-nav-btn" id="sidebar-suggestions-btn" onclick="switchPage('page-suggestions', this); loadSuggestionsPage();" title="Đề xuất và góp ý">
+        <span class="sidebar-nav-icon">💬</span>
+        <span class="sidebar-nav-label">Đề xuất và góp ý</span>
       </button>
       <button class="sidebar-nav-btn" id="sidebar-admin-btn" onclick="switchPage('page-admin', this); loadAdminTab();" title="Quản trị" style="display:none">
         <span class="sidebar-nav-icon">🛡️</span>
@@ -73,7 +82,59 @@
     </div>
     <main class="main-content" id="main-content">
 
-      <!-- ══ Page: Thiết lập báo cáo khả thi ══════════════════════════════ -->
+      <!-- ══ Page: Thiết lập báo cáo khả thi (khung trống — nội dung làm sau) ═══ -->
+      <div id="page-feasibility" class="page-panel">
+        <div class="section-card">
+          <div class="section-header">
+            <div class="section-icon icon-cyan">📊</div>
+            <div class="section-title">Thiết lập báo cáo khả thi</div>
+            <div class="section-subtitle">Nhập hoạt chất (1 hoặc nhiều) + dạng bào chế → hệ thống tự điền biểu mẫu BM/QT/RD03.08. Mọi ô đều sửa được trước khi xuất Word.</div>
+          </div>
+          <div class="section-body">
+            <div class="search-row">
+              <div class="input-group">
+                <label>Tên hoạt chất <span style="color:var(--red)">*</span></label>
+                <div id="fz-drug-name-list">
+                  <div class="drug-name-row">
+                    <input class="input-field drug-name-input" type="text" placeholder="VD: paracetamol" autocomplete="off" spellcheck="false" />
+                    <button type="button" class="btn-xoa-hoat-chat" onclick="xoaDongHoatChat(this)" title="Xoá hoạt chất này" aria-label="Xoá hoạt chất này">✕</button>
+                  </div>
+                </div>
+                <button type="button" id="btn-them-fz-drug-name-list" class="btn-them-hoat-chat" onclick="themDongHoatChat('', 'fz-drug-name-list')">+ Thêm hoạt chất</button>
+              </div>
+              <div class="input-group">
+                <label for="fz-dosage-form">Dạng bào chế <span style="color:var(--red)">*</span></label>
+                <select id="fz-dosage-form" class="input-field" style="appearance:none;"><path d=%22M7 10l5 5 5-5z%22/></svg>'); background-repeat: no-repeat; background-position-x: 98%; background-position-y: 50%;">
+                  <option value="" disabled selected style="color: #0f172a; background: #fff;">Ví dụ: viên nén, hỗn dịch...</option>
+                  <option value="Tablet" style="color: #0f172a; background: #fff;">Viên nén (Tablet)</option>
+                  <option value="Effervescent tablet" style="color: #0f172a; background: #fff;">Viên sủi (Effervescent tablet)</option>
+                  <option value="Capsule" style="color: #0f172a; background: #fff;">Viên nang (Capsule)</option>
+                  <option value="Soft capsule" style="color: #0f172a; background: #fff;">Viên nang mềm (Soft capsule)</option>
+                  <option value="Solution" style="color: #0f172a; background: #fff;">Dung dịch (Solution)</option>
+                  <option value="Suspension" style="color: #0f172a; background: #fff;">Hỗn dịch (Suspension)</option>
+                  <option value="Granules" style="color: #0f172a; background: #fff;">Cốm (Granules)</option>
+                  <option value="Injection" style="color: #0f172a; background: #fff;">Thuốc tiêm (Injection)</option>
+                  <option value="Cream/Ointment" style="color: #0f172a; background: #fff;">Kem/Mỡ (Cream/Ointment)</option>
+                  <option value="Eye drops" style="color: #0f172a; background: #fff;">Thuốc nhỏ mắt (Eye drops)</option>
+                </select>
+              </div>
+              <button id="btn-fz" class="btn-search" onclick="startFeasibility()"><span>📊</span> Lập báo cáo</button>
+            </div>
+            <div id="fz-status" class="text-sm text-3" style="margin-top:.8rem"></div>
+          </div>
+        </div>
+        <div id="fz-report" style="display:none">
+          <div class="section-card">
+            <div class="section-body" style="display:flex;gap:.6rem;align-items:center;flex-wrap:wrap">
+              <button class="btn-search" onclick="exportFeasibility()">⬇️ Xuất Word (.docx)</button>
+              <span class="text-sm text-3">Chỉnh sửa trực tiếp các ô bên dưới (nền vàng nhạt = có thể sửa). Nội dung xuất ra Word đúng như đang hiển thị.</span>
+            </div>
+          </div>
+          <div id="fz-body"></div>
+        </div>
+      </div><!-- /page-feasibility -->
+
+      <!-- ══ Page: Thiết lập protocol nghiên cứu ══════════════════════════════ -->
       <div id="page-setup" class="page-panel active">
 
         <!-- Hero + Search -->
@@ -85,9 +146,20 @@
             <div class="search-row">
               <div class="input-group">
                 <label for="drug-name">Tên hoạt chất <span style="color:var(--red)">*</span></label>
-                <input id="drug-name" class="input-field" type="text"
-                  placeholder="VD: ibuprofen, metformin, amlodipine…"
-                  autocomplete="off" spellcheck="false" />
+                <!-- Thuốc phối hợp: MỖI hoạt chất một ô riêng. Không gộp chung rồi tách bằng dấu vì
+                     nhiều tên chuẩn vốn đã chứa dấu ngăn ("amoxicillin/clavulanate") nên sẽ tách nhầm.
+                     Ô đầu tiên dựng sẵn ở đây; các ô sau do dropDongHoatChat() sinh ra. -->
+                <div id="drug-name-list">
+                  <div class="drug-name-row">
+                    <input class="input-field drug-name-input" type="text"
+                      placeholder="VD: ibuprofen, metformin, amlodipine…"
+                      autocomplete="off" spellcheck="false" />
+                    <button type="button" class="btn-xoa-hoat-chat" onclick="xoaDongHoatChat(this)"
+                      title="Xoá hoạt chất này" aria-label="Xoá hoạt chất này">✕</button>
+                  </div>
+                </div>
+                <button type="button" id="btn-them-hoat-chat" class="btn-them-hoat-chat"
+                  onclick="themDongHoatChat()">+ Thêm hoạt chất</button>
               </div>
               <div class="input-group">
                 <label for="dosage-form">Dạng bào chế <span style="color:var(--red)">*</span></label>
@@ -96,7 +168,7 @@
                   <option value="Tablet" style="color: #0f172a; background: #fff;">Viên nén (Tablet)</option>
                   <option value="Effervescent tablet" style="color: #0f172a; background: #fff;">Viên sủi (Effervescent tablet)</option>
                   <option value="Capsule" style="color: #0f172a; background: #fff;">Viên nang (Capsule)</option>
-                  <option value="Softgel" style="color: #0f172a; background: #fff;">Viên nang mềm (Softgel)</option>
+                  <option value="Soft capsule" style="color: #0f172a; background: #fff;">Viên nang mềm (Soft capsule)</option>
                   <option value="Solution" style="color: #0f172a; background: #fff;">Dung dịch (Solution)</option>
                   <option value="Suspension" style="color: #0f172a; background: #fff;">Hỗn dịch (Suspension)</option>
                   <option value="Granules" style="color: #0f172a; background: #fff;">Cốm (Granules)</option>
@@ -120,6 +192,8 @@
                 <label class="search-section-check"><input type="checkbox" id="cb-pharma" checked> 📖 Dược điển</label>
                 <label class="search-section-check"><input type="checkbox" id="cb-compatibility" checked> 🤝 Tương tác tá dược</label>
                 <label class="search-section-check"><input type="checkbox" id="cb-clinical" checked> 📋 Thông tin dược lý & bào chế</label>
+                <!-- Chỉ có ý nghĩa khi tra ≥2 hoạt chất — ẩn mặc định, updateCombinationUI() tự hiện. -->
+                <label class="search-section-check" id="wrap-cb-apimix" style="display:none"><input type="checkbox" id="cb-apimix" checked> ⚠️ Tương kỵ giữa các hoạt chất</label>
               </div>
             </div>
 
@@ -185,6 +259,10 @@
             </button>
             <button class="tab-btn" role="tab" onclick="switchTab('tab-compatibility', this)">
               🤝 Tương tác tá dược
+            </button>
+            <!-- Chỉ có ý nghĩa khi tra ≥2 hoạt chất — ẩn mặc định, updateCombinationUI() tự hiện. -->
+            <button class="tab-btn" role="tab" onclick="switchTab('tab-apimix', this)" id="tab-apimix-btn" style="display:none">
+              ⚠️ Tương kỵ giữa các hoạt chất
             </button>
             <button class="tab-btn" role="tab" onclick="switchTab('tab-assistant', this)">
               🤖 Trợ lý AI
@@ -446,6 +524,29 @@
             </div>
           </div><!-- /tab-compatibility -->
 
+          <!-- ══ Tab 6b: Tương kỵ GIỮA CÁC HOẠT CHẤT (chỉ có ý nghĩa khi ≥2 hoạt chất) ══ -->
+          <div id="tab-apimix" class="tab-panel">
+            <div class="dc-toolbar">
+              <button class="dc-btn" onclick="doubleCheck('apimix')">🔍 Double-check mục này</button>
+              <span class="dc-result" id="dc-result-apimix"></span>
+            </div>
+            <div class="section-card">
+              <div class="section-header">
+                <div class="section-icon icon-amber">⚠️</div>
+                <div class="section-title">Tương kỵ lý–hóa giữa các hoạt chất trong công thức</div>
+                <div class="section-subtitle">Khác với "Tương tác tá dược": đây là tương kỵ giữa CHÍNH các hoạt chất với nhau khi cùng tồn tại trong một công thức phối hợp.</div>
+              </div>
+              <div class="section-body">
+                <div id="sec-apimix-results">
+                  <div class="empty-state" style="padding:2rem">
+                    <div class="empty-state-icon">⚠️</div>
+                    <div class="empty-state-sub">Cần nhập từ 2 hoạt chất trở lên và bấm Tra cứu để phân tích tương kỵ.</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div><!-- /tab-apimix -->
+
           <!-- ══ Tab 7: Clinical / Pharmacology info ═══════════════════════════ -->
           <div id="tab-clinical" class="tab-panel active">
             <div class="dc-toolbar">
@@ -527,8 +628,13 @@
         <div class="section-card">
           <div class="section-header">
             <div class="section-icon icon-blue">🕘</div>
-            <div class="section-title">Lịch sử tra cứu</div>
+            <div class="section-title">Lịch sử</div>
           </div>
+          <div class="tabs-wrap" role="tablist" style="margin:0 1rem">
+            <button class="tab-btn active" id="hist-tab-search" role="tab" onclick="showHistoryTab('search')">🔎 Tra cứu</button>
+            <button class="tab-btn" id="hist-tab-fz" role="tab" onclick="showHistoryTab('fz')">📊 Báo cáo khả thi</button>
+          </div>
+          <div class="section-body" id="sec-history-fz-list" style="display:none"></div>
           <div class="section-body" id="sec-history-list">
             <div class="empty-state" style="padding:2rem">
               <div class="empty-state-icon">🕘</div>
@@ -711,12 +817,44 @@
         </div>
       </div><!-- /page-admin -->
 
+      <div id="page-suggestions" class="page-panel">
+        <div class="section-card">
+          <div class="section-header">
+            <div class="section-icon icon-cyan">💬</div>
+            <div class="section-title">Đề xuất và góp ý</div>
+            <div class="section-subtitle">Gặp lỗi hoặc có ý tưởng cải thiện trong lúc dùng? Điền vào đây để được xử lý.</div>
+          </div>
+          <div class="section-body">
+            <div class="input-group">
+              <label for="sugg-name">Tên của bạn</label>
+              <input id="sugg-name" class="input-field" type="text" placeholder="VD: Trần Văn A" autocomplete="off" />
+            </div>
+            <div class="input-group" style="margin-top:.6rem">
+              <label for="sugg-content">Góp ý</label>
+              <textarea id="sugg-content" class="input-field" rows="4" placeholder="Mô tả lỗi gặp phải hoặc ý tưởng cải thiện..."></textarea>
+            </div>
+            <button class="btn-search" style="margin-top:.6rem" onclick="submitSuggestion()">💾 Lưu góp ý</button>
+            <div id="sugg-submit-status" class="text-sm text-3" style="margin-top:.5rem"></div>
+          </div>
+        </div>
+        <div class="section-card">
+          <div class="section-header">
+            <div class="section-icon icon-cyan">📋</div>
+            <div class="section-title">Danh sách góp ý</div>
+            <div class="section-subtitle">Mọi người đã đăng nhập đều xem được danh sách này; chỉ quản trị viên đánh dấu được "Hoàn thành".</div>
+          </div>
+          <div class="section-body" id="sec-suggestions-list">
+            <div class="skeleton" style="height:120px;border-radius:12px;"></div>
+          </div>
+        </div>
+      </div><!-- /page-suggestions -->
+
     </main>
   </div><!-- /app-main -->
 
 </div><!-- /app-shell -->
 </div><!-- /app-wrapper -->
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
-<script src="app.js"></script>
+<script src="app.js?v=20261009f"></script>
 </body>
 </html>

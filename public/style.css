@@ -1397,3 +1397,80 @@ select.input-field:invalid { color: var(--text-3); }
   cursor: pointer; color: var(--blue); border-bottom: 1px dashed currentColor;
 }
 .psel-ask-eg:hover { opacity: .75; }
+
+/* ── Nhập NHIỀU hoạt chất (thuốc phối hợp) ───────────────────────────────────
+   Mỗi hoạt chất một ô riêng. Nút ✕ nằm trong luồng chứ không đè lên ô nhập, để
+   không che mất chữ khi tên hoạt chất dài (vd "Metformin hydrochloride"). */
+#drug-name-list { display: flex; flex-direction: column; gap: 6px; }
+
+.drug-name-row { display: flex; align-items: center; gap: 6px; }
+.drug-name-row .input-field { flex: 1; min-width: 0; }
+
+.btn-xoa-hoat-chat {
+  flex: 0 0 auto;
+  width: 30px; height: 30px;
+  display: flex; align-items: center; justify-content: center;
+  border: 1px solid var(--card-border);
+  border-radius: var(--r-md);
+  background: rgba(15,23,42,0.03);
+  color: var(--text-3);
+  font-size: 0.8rem; line-height: 1;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+.btn-xoa-hoat-chat:hover { color: var(--red); border-color: var(--red); background: rgba(239,68,68,0.08); }
+
+/* Chỉ còn ĐÚNG một hoạt chất thì ẩn nút xoá — không cho xoá nốt ô cuối cùng.
+   Dùng :only-child nên không cần JS bật/tắt, trạng thái luôn đúng. */
+.drug-name-row:only-child .btn-xoa-hoat-chat { display: none; }
+
+.btn-them-hoat-chat {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 0.3rem 0.6rem;
+  border: 1px dashed var(--card-border);
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--blue);
+  font-size: 0.75rem; font-weight: 600; font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.btn-them-hoat-chat:hover { border-color: var(--blue); background: rgba(59,130,246,0.07); }
+.btn-them-hoat-chat:disabled { opacity: 0.45; cursor: not-allowed; border-style: solid; }
+
+/* ── Báo cáo khả thi (BM/QT/RD03.08) ───────────────────────────────────────── */
+.fz-card { margin-bottom: 1rem; }
+.fz-h1 { font-weight: 700; font-size: 1rem; margin: .2rem 0 .5rem; color: var(--text-1); }
+.fz-h2 { font-weight: 700; font-size: .9rem; margin: .6rem 0 .3rem; color: var(--text-1); }
+.fz-note { font-size: .78rem; color: var(--text-3); font-style: italic; margin-bottom: .4rem; white-space: pre-line; }
+.fz-ta-label { font-size: .8rem; font-weight: 600; margin: .5rem 0 .2rem; }
+.fz-ta { width: 100%; font-family: inherit; font-size: .85rem; line-height: 1.5; padding: .5rem .7rem;
+  border: 1px solid var(--card-border); border-radius: 8px; resize: none; overflow: hidden; }
+.fz-edit { background: rgba(251,191,36,.06); }
+.fz-cell { white-space: pre-line; vertical-align: top; min-width: 60px; font-size: .8rem; }
+.fz-cell:focus, .fz-ta:focus, .fz-foot:focus { outline: 2px solid rgba(59,130,246,.45); background: #fff; }
+.fz-sec { font-weight: 700; background: rgba(15,23,42,.05); }
+.fz-tbl-title { font-weight: 700; text-align: center; margin: .6rem 0 .3rem; font-size: .85rem; }
+.fz-foot { font-weight: 700; font-size: .82rem; padding: .35rem .5rem; border: 1px solid var(--card-border); border-top: none; background: rgba(251,191,36,.06); }
+.fz-chk { display: inline-flex; align-items: center; gap: .35rem; margin-right: 1.2rem; font-size: .85rem; }
+.fz-struct { display: inline-block; margin: .6rem 1rem .2rem 0; text-align: center; }
+.fz-struct img { width: 200px; height: 200px; object-fit: contain; background: #fff; border: 1px solid var(--card-border); border-radius: 8px; }
+.fz-mono-box { margin-bottom: .8rem; padding: .7rem; border: 1px dashed var(--card-border); border-radius: 8px; }
+.fz-mono { margin: 3px; padding: 4px 10px; border: 1px solid var(--card-border); border-radius: 100px; background: #fff; cursor: pointer; font-size: .75rem; }
+.fz-mono:hover { border-color: var(--blue); color: var(--blue); }
+.fz-sign { margin-top: 1rem; font-size: .8rem; color: var(--text-3); font-style: italic; }
+.fz-st { display: inline-block; margin: 2px 8px 2px 0; padding: 2px 8px; border-radius: 6px; font-size: .78rem; }
+.fz-st-err { color: #b45309; }
+
+/* Tiến độ báo cáo khả thi */
+.fz-tong { display: flex; align-items: center; gap: .6rem; width: 100%; margin-bottom: .5rem; font-size: .8rem; font-weight: 600; }
+.fz-tong-bar { flex: 1; max-width: 360px; height: 8px; border-radius: 999px; background: rgba(148,163,184,.25); overflow: hidden; }
+.fz-tong-bar > div { height: 100%; background: linear-gradient(90deg, #3b82f6, #8b5cf6); transition: width .4s; }
+.fz-st-run { background: linear-gradient(90deg, rgba(59,130,246,.22) var(--p, 0%), rgba(148,163,184,.10) var(--p, 0%)); }
+
+/* Chọn chuyên luận dược điển chia theo dạng bào chế */
+.fz-mono-nhom { margin: .6rem 0 .2rem; }
+.fz-mono-nhom-tt { font-weight: 700; font-size: .85rem; margin-bottom: .3rem; }
+.fz-mono-dang { font-weight: 600; font-size: .72rem; color: #16a34a; }
+.fz-mono-bk { display: inline-block; font-size: .65rem; font-weight: 700; padding: 1px 6px; margin-right: 4px; border-radius: 999px; background: rgba(99,102,241,.14); color: #4f46e5; }
